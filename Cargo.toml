@@ -1,0 +1,28 @@
+[package]
+name = "treelix"
+version = "0.1.0"
+edition = "2021"
+description = "An nvim-tree-style terminal file explorer for the Helix editor, written in Rust"
+license = "MIT"
+repository = "https://github.com/kodyberry23/treelix"
+
+[[bin]]
+name = "treelix"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+notify = "7"
+notify-debouncer-full = "0.4"
+nucleo-matcher = "0.3"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+directories = "5"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

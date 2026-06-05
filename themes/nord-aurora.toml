@@ -1,0 +1,50 @@
+# treelix built-in theme: Deep Nord Aurora.
+#
+# Format:
+#   [palette]   name = "#RRGGBB"
+#   [styles]    element = "fg" | "fg / bg" | "fg / bg / mod,mod"
+#               where fg/bg is a palette name, a #hex value, or "none".
+#               modifiers: bold, italic, underline, dim, reversed.
+
+[palette]
+polar0 = "#1A1F28"
+polar1 = "#232934"
+polar2 = "#2C333E"
+polar3 = "#4F5870"
+snow0  = "#D8DEE9"
+snow1  = "#E5E9F0"
+snow2  = "#ECEFF4"
+frost0 = "#6FBAB7"
+frost1 = "#74BCD9"
+frost2 = "#5F8FBF"
+frost3 = "#426F9E"
+red    = "#D04E5C"
+orange = "#D97757"
+yellow = "#DDB867"
+green  = "#8DBC6E"
+purple = "#B97AB6"
+
+[styles]
+text          = "snow0"
+background    = "none"
+selection     = "none / polar3"
+directory     = "frost1 / none / bold"
+root          = "snow2 / none / bold"
+indent_marker = "polar3"
+arrow         = "polar3"
+icon          = "snow0"
+folder_icon   = "frost1"
+symlink       = "frost0"
+executable    = "green"
+git_staged    = "green"
+git_dirty     = "yellow"
+git_deleted   = "red"
+git_renamed   = "yellow"
+git_conflict  = "red"
+git_untracked = "orange"
+git_ignored   = "polar3"
+cut           = "red / none / italic"
+copy          = "yellow"
+help          = "snow0 / polar1"
+help_title    = "frost1 / polar1 / bold"
+prompt        = "orange / none / bold"
