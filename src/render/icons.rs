@@ -11,6 +11,8 @@ pub const SYMLINK: &str = "";
 pub const ARROW_CLOSED: &str = "";
 pub const ARROW_OPEN: &str = "";
 
+pub const BOOKMARK: &str = "";
+
 /// Resolve the glyph for a node. Directories use folder/arrow glyphs handled by
 /// the builder; this returns file icons (and a default folder icon).
 pub fn file_icon(name: &str, kind: NodeKind, expanded: bool) -> &'static str {

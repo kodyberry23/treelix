@@ -7,6 +7,7 @@ mod editor;
 mod git;
 mod ipc;
 mod keymap;
+mod marks;
 mod render;
 mod theme;
 mod tree;
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -131,34 +133,40 @@ fn print_help() {
 }
 
 fn run_tui(root: PathBuf, config: Config, theme: Theme) -> Result<()> {
-    let mut terminal = setup_terminal()?;
+    let mouse = config.mouse;
+    let mut terminal = setup_terminal(mouse)?;
     // Restore the terminal even if the app panics.
-    let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore_terminal();
-        default_hook(info);
+        let _ = restore_terminal(mouse);
+        eprintln!("{info}");
     }));
 
     let mut app = App::new(root, config, theme);
     let result = app.run(&mut terminal);
 
-    restore_terminal()?;
+    restore_terminal(mouse)?;
     result
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
     Ok(terminal)
 }
 
-fn restore_terminal() -> Result<()> {
-    disable_raw_mode()?;
+fn restore_terminal(mouse: bool) -> Result<()> {
     let mut stdout = io::stdout();
+    if mouse {
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
     execute!(stdout, LeaveAlternateScreen)?;
+    disable_raw_mode()?;
     Ok(())
 }

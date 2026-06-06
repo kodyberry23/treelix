@@ -12,10 +12,26 @@ pub struct Config {
     pub theme: String,
     /// Whether to render Nerd Font glyphs (set false for ASCII fallbacks).
     pub icons: bool,
+    /// Render expand/collapse arrows before folder icons.
+    pub arrows: bool,
     /// Show dotfiles by default.
     pub show_hidden: bool,
     /// Show git-ignored files by default.
     pub show_ignored: bool,
+    /// Sort mode: name | modified | extension | filetype.
+    pub sort: String,
+    /// Place files before directories.
+    pub files_first: bool,
+    /// Collapse chains of sole-child directories into one line by default.
+    pub group_empty: bool,
+    /// Enable mouse support (click to open/cd, scroll).
+    pub mouse: bool,
+    /// Persist bookmarks to `~/.config/treelix/bookmarks`.
+    pub bookmarks_persist: bool,
+    /// Substring patterns hidden when the custom filter (`U`) is active.
+    pub exclude: Vec<String>,
+    /// Filenames (lowercase) highlighted as "special".
+    pub special_files: Vec<String>,
     /// Command used to open a file in the editor. `{mode}` is replaced with
     /// `open`/`vsplit`/`hsplit` and `{path}` with the absolute path. When unset,
     /// treelix uses its built-in Helix-socket dispatch (see `editor.rs`).
@@ -27,11 +43,37 @@ impl Default for Config {
         Config {
             theme: "nord-aurora".to_string(),
             icons: true,
+            arrows: false,
             show_hidden: false,
             show_ignored: false,
+            sort: "name".to_string(),
+            files_first: false,
+            group_empty: false,
+            mouse: true,
+            bookmarks_persist: false,
+            exclude: Vec::new(),
+            special_files: default_special_files(),
             open_command: None,
         }
     }
+}
+
+fn default_special_files() -> Vec<String> {
+    [
+        "cargo.toml",
+        "makefile",
+        "readme.md",
+        "readme",
+        "license",
+        "license.md",
+        "package.json",
+        "dockerfile",
+        "flake.nix",
+        ".gitignore",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Config {

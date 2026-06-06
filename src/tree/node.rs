@@ -2,6 +2,7 @@
 //! collapse keeps the cached subtree.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::git::GitStatus;
 
@@ -36,6 +37,10 @@ pub struct Node {
     pub git: Option<GitStatus>,
     /// Symlink destination, for display.
     pub link_to: Option<PathBuf>,
+    /// File size in bytes (0 for directories).
+    pub len: u64,
+    /// Last-modified time, if available.
+    pub mtime: Option<SystemTime>,
 }
 
 impl Node {
@@ -54,6 +59,8 @@ impl Node {
             executable,
             git: None,
             link_to,
+            len: 0,
+            mtime: None,
         }
     }
 

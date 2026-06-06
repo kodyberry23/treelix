@@ -34,9 +34,14 @@ pub struct Theme {
     pub git_ignored: Style,
     pub cut: Style,
     pub copy: Style,
+    pub special: Style,
+    pub opened: Style,
+    pub bookmark: Style,
+    pub selected: Style,
     pub help: Style,
     pub help_title: Style,
     pub prompt: Style,
+    pub filter_prefix: Style,
 }
 
 impl Default for Theme {
@@ -119,9 +124,14 @@ impl Theme {
             git_ignored: get("git_ignored", text),
             cut: get("cut", text),
             copy: get("copy", text),
+            special: get("special", text),
+            opened: get("opened", text),
+            bookmark: get("bookmark", text),
+            selected: get("selected", text),
             help: get("help", text),
             help_title: get("help_title", text),
             prompt: get("prompt", text),
+            filter_prefix: get("filter_prefix", text),
         })
     }
 }
@@ -241,6 +251,10 @@ pub mod helix {
         theme.git_conflict = theme.git_deleted;
         theme.git_untracked = style_of(scope_fg("special"), theme.git_untracked);
         theme.git_ignored = style_of(scope_fg("comment"), theme.git_ignored);
+        theme.special = style_of(scope_fg("constant"), theme.special).add_modifier(Modifier::BOLD);
+        theme.opened = style_of(scope_fg("ui.text.focus"), theme.opened).add_modifier(Modifier::BOLD);
+        theme.bookmark = style_of(scope_fg("keyword"), theme.bookmark);
+        theme.filter_prefix = style_of(scope_fg("keyword"), theme.filter_prefix);
         // Selection: use ui.selection bg.
         if let Some(t) = theme_value.get("ui.selection").and_then(|v| v.as_table()) {
             if let Some(c) = t.get("bg").and_then(|b| b.as_str()).and_then(|s| resolve_color(s, &palette)) {

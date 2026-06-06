@@ -1,6 +1,6 @@
-//! Tree operations: lazy load, sort (dirs first), flatten to visible rows with
-//! indent-marker metadata, reveal-by-path, git application, and expand/collapse
-//! state snapshot+restore (used to preserve UI state across reloads).
+//! Tree operations: lazy load, sort, flatten to visible rows with indent-marker
+//! metadata, reveal-by-path, git application, group-empty collapsing, filtering,
+//! and expand/collapse state snapshot+restore.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,6 +9,58 @@ use std::path::{Path, PathBuf};
 use crate::git::{GitData, GitStatus};
 
 use super::node::{Node, NodeKind};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Name,
+    Modified,
+    Extension,
+    FileType,
+}
+
+impl SortMode {
+    pub fn parse(s: &str) -> SortMode {
+        match s.to_lowercase().as_str() {
+            "modified" | "mtime" => SortMode::Modified,
+            "extension" | "ext" => SortMode::Extension,
+            "filetype" | "type" => SortMode::FileType,
+            _ => SortMode::Name,
+        }
+    }
+}
+
+/// Per-render view options: filters, sorting, grouping.
+pub struct ViewOptions<'a> {
+    pub show_hidden: bool,
+    pub show_ignored: bool,
+    /// Show only git-changed (dirty) nodes.
+    pub git_clean: bool,
+    pub group_empty: bool,
+    pub sort: SortMode,
+    pub files_first: bool,
+    /// Custom exclude patterns (substring match), applied when `custom_active`.
+    pub exclude: &'a [String],
+    pub custom_active: bool,
+    /// Each node must be present in every set here to be visible (used for live
+    /// filter, no_bookmark, no_buffer — app precomputes sets-with-ancestors).
+    pub restricts: &'a [&'a HashSet<PathBuf>],
+}
+
+impl Default for ViewOptions<'_> {
+    fn default() -> Self {
+        ViewOptions {
+            show_hidden: false,
+            show_ignored: false,
+            git_clean: false,
+            group_empty: false,
+            sort: SortMode::Name,
+            files_first: false,
+            exclude: &[],
+            custom_active: false,
+            restricts: &[],
+        }
+    }
+}
 
 /// A flattened, render-ready snapshot of one visible line.
 #[derive(Debug, Clone)]
@@ -22,17 +74,26 @@ pub struct Row {
     pub executable: bool,
     pub git: Option<GitStatus>,
     pub link_to: Option<PathBuf>,
-    /// For each ancestor level, whether that ancestor was the last among its
-    /// siblings (→ render blank) or not (→ render a vertical bar).
+    /// For group-empty rows, the deepest directory in the chain (target for
+    /// cd/create); `None` when not a grouped row.
+    pub group_target: Option<PathBuf>,
+    /// For each level (including this node, as the last element), whether the
+    /// node at that level is the last among its siblings; drives indent glyphs.
     pub ancestor_last: Vec<bool>,
-    /// Whether this node itself is the last among its siblings.
-    pub is_last: bool,
+}
+
+impl Row {
+    /// Directory to act in for create/cd (deepest of a grouped chain).
+    pub fn dir_target(&self) -> &Path {
+        self.group_target.as_deref().unwrap_or(&self.path)
+    }
 }
 
 pub struct Tree {
     pub root: Node,
     pub show_hidden: bool,
     pub show_ignored: bool,
+    pub group_empty: bool,
 }
 
 impl Tree {
@@ -43,12 +104,13 @@ impl Tree {
             root,
             show_hidden: false,
             show_ignored: false,
+            group_empty: false,
         };
         tree.load_children(&tree.root.path.clone());
         tree
     }
 
-    /// Read children of the directory at `path` from disk, sorted, if not loaded.
+    /// Read children of the directory at `path` from disk, if not loaded.
     pub fn load_children(&mut self, path: &Path) {
         if let Some(node) = self.root.find_mut(path) {
             if node.is_dir() && !node.loaded {
@@ -59,18 +121,39 @@ impl Tree {
     }
 
     pub fn toggle(&mut self, path: &Path) {
-        let needs_load = matches!(self.root.find_mut(path), Some(n) if n.is_dir() && !n.loaded);
-        if needs_load {
-            self.load_children(path);
-        }
-        if let Some(node) = self.root.find_mut(path) {
-            if node.is_dir() {
-                node.expanded = !node.expanded;
-            }
+        let expanded = matches!(self.root.find_mut(path), Some(n) if n.is_dir() && n.expanded);
+        if expanded {
+            self.collapse(path);
+        } else {
+            self.expand(path);
         }
     }
 
     pub fn expand(&mut self, path: &Path) {
+        self.do_expand(path);
+        // Group-empty: chain-expand through sole-child directories so the whole
+        // chain renders as one line.
+        if self.group_empty {
+            let mut cur = path.to_path_buf();
+            loop {
+                let next = match self.root.find_mut(&cur) {
+                    Some(n) if n.is_dir() && n.children.len() == 1 && n.children[0].is_dir() => {
+                        Some(n.children[0].path.clone())
+                    }
+                    _ => None,
+                };
+                match next {
+                    Some(child) => {
+                        self.do_expand(&child);
+                        cur = child;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    fn do_expand(&mut self, path: &Path) {
         let needs_load = matches!(self.root.find_mut(path), Some(n) if n.is_dir() && !n.loaded);
         if needs_load {
             self.load_children(path);
@@ -92,7 +175,7 @@ impl Tree {
     pub fn expand_all(&mut self) {
         let mut stack = vec![self.root.path.clone()];
         while let Some(p) = stack.pop() {
-            self.expand(&p);
+            self.do_expand(&p);
             if let Some(node) = self.root.find_mut(&p) {
                 for c in &node.children {
                     if c.is_dir() {
@@ -141,34 +224,30 @@ impl Tree {
     /// Rebuild children from disk for the root and every still-existing
     /// previously-expanded directory. Cheap: only reads expanded dirs.
     pub fn reload_preserving(&mut self, expanded: &HashSet<PathBuf>) {
-        // Reset root to a fresh, unloaded directory, then re-expand.
         let root_path = self.root.path.clone();
         let mut root = Node::new(root_path, NodeKind::Directory, false, None);
         root.expanded = true;
         self.root = root;
         self.load_children(&self.root.path.clone());
 
-        // Re-expand in path-depth order so parents load before children.
         let mut paths: Vec<&PathBuf> = expanded.iter().collect();
         paths.sort_by_key(|p| p.components().count());
         for p in paths {
             if p.exists() {
-                self.expand(p);
+                self.do_expand(p);
             }
         }
     }
 
-    /// Expand all ancestors of `target` so it becomes visible. Returns true if
-    /// the target path exists within the tree.
+    /// Expand all ancestors of `target` so it becomes visible.
     pub fn reveal(&mut self, target: &Path) -> bool {
         if !target.starts_with(&self.root.path) {
             return false;
         }
-        // Expand each ancestor directory from root down to the target's parent.
         let mut cur = self.root.path.clone();
-        if let Some(rel) = target.strip_prefix(&self.root.path).ok() {
+        if let Ok(rel) = target.strip_prefix(&self.root.path) {
             for comp in rel.components() {
-                self.expand(&cur);
+                self.do_expand(&cur);
                 cur = cur.join(comp);
                 if cur == *target {
                     break;
@@ -185,11 +264,9 @@ impl Tree {
                 n.git = statuses.get(&n.path).copied();
                 return n.git;
             }
-            // Directory: own explicit status (e.g. ignored) plus children's max.
             let mut best = statuses.get(&n.path).copied();
             for c in &mut n.children {
                 if let Some(s) = walk(c, statuses) {
-                    // Ignored does not propagate up over real changes.
                     if s != GitStatus::Ignored {
                         best = Some(best.map_or(s, |b| b.max(s)));
                     } else if best.is_none() {
@@ -203,72 +280,149 @@ impl Tree {
         walk(&mut self.root, &data.statuses);
     }
 
-    /// Flatten the visible tree into rows, honoring filter toggles.
-    pub fn flatten(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        self.flatten_into(&self.root, 0, &mut Vec::new(), &mut rows);
-        rows
+    /// Flatten the visible tree into rows.
+    pub fn flatten(&self, opts: &ViewOptions) -> Vec<Row> {
+        let mut out = Vec::new();
+        if self.root.expanded {
+            let vis = self.visible_sorted(&self.root, opts);
+            let last = vis.len().saturating_sub(1);
+            let mut anc = Vec::new();
+            for (i, c) in vis.iter().enumerate() {
+                anc.push(i == last);
+                self.emit(c, &mut anc, opts, &mut out);
+                anc.pop();
+            }
+        }
+        out
     }
 
-    fn flatten_into(
-        &self,
-        node: &Node,
-        depth: usize,
-        ancestor_last: &mut Vec<bool>,
-        out: &mut Vec<Row>,
-    ) {
-        if depth > 0 {
-            // Root itself is rendered as a header elsewhere; only push non-root.
-            let has_children = node.is_dir() && (!node.loaded || !node.children.is_empty());
-            out.push(Row {
-                path: node.path.clone(),
-                name: node.name.clone(),
-                kind: node.kind,
-                depth: depth - 1,
-                expanded: node.expanded,
-                has_children,
-                executable: node.executable,
-                git: node.git,
-                link_to: node.link_to.clone(),
-                ancestor_last: ancestor_last.clone(),
-                is_last: false, // patched below
-            });
-        }
+    fn emit(&self, node: &Node, ancestor_last: &mut Vec<bool>, opts: &ViewOptions, out: &mut Vec<Row>) {
+        let (name, deepest) = self.group_chain(node, opts);
+        let depth = ancestor_last.len().saturating_sub(1);
+        let has_children =
+            deepest.is_dir() && (!deepest.loaded || deepest.children.iter().any(|c| self.is_visible(c, opts)));
+        let group_target = if deepest.path != node.path {
+            Some(deepest.path.clone())
+        } else {
+            None
+        };
 
-        if node.is_dir() && node.expanded {
-            let visible: Vec<&Node> = node
-                .children
-                .iter()
-                .filter(|c| self.is_visible(c))
-                .collect();
-            let last_idx = visible.len().saturating_sub(1);
-            for (i, child) in visible.iter().enumerate() {
-                let is_last = i == last_idx;
-                let start = out.len();
-                ancestor_last.push(is_last);
-                self.flatten_into(child, depth + 1, ancestor_last, out);
+        out.push(Row {
+            path: node.path.clone(),
+            name,
+            kind: node.kind,
+            depth,
+            expanded: node.expanded,
+            has_children,
+            executable: node.executable,
+            git: node.git,
+            link_to: node.link_to.clone(),
+            group_target,
+            ancestor_last: ancestor_last.clone(),
+        });
+
+        if node.expanded && deepest.is_dir() {
+            let vis = self.visible_sorted(deepest, opts);
+            let last = vis.len().saturating_sub(1);
+            for (i, c) in vis.iter().enumerate() {
+                ancestor_last.push(i == last);
+                self.emit(c, ancestor_last, opts, out);
                 ancestor_last.pop();
-                // Patch the child's own row is_last flag.
-                if let Some(row) = out.get_mut(start) {
-                    row.is_last = is_last;
-                }
             }
         }
     }
 
-    fn is_visible(&self, node: &Node) -> bool {
-        if !self.show_hidden && node.is_hidden() {
+    /// Follow a chain of sole-child directories, returning the joined display
+    /// name and the deepest directory.
+    fn group_chain<'t>(&'t self, node: &'t Node, opts: &ViewOptions) -> (String, &'t Node) {
+        let mut name = node.name.clone();
+        let mut cur = node;
+        while opts.group_empty && cur.expanded {
+            let vis = self.visible_sorted(cur, opts);
+            if vis.len() == 1 && vis[0].is_dir() {
+                cur = vis[0];
+                name = format!("{name}/{}", cur.name);
+            } else {
+                break;
+            }
+        }
+        (name, cur)
+    }
+
+    fn visible_sorted<'t>(&'t self, dir: &'t Node, opts: &ViewOptions) -> Vec<&'t Node> {
+        let mut v: Vec<&Node> = dir.children.iter().filter(|c| self.is_visible(c, opts)).collect();
+        sort_refs(&mut v, opts.sort, opts.files_first);
+        v
+    }
+
+    fn is_visible(&self, node: &Node, opts: &ViewOptions) -> bool {
+        if !opts.show_hidden && node.is_hidden() {
             return false;
         }
-        if !self.show_ignored && node.git == Some(GitStatus::Ignored) {
+        if !opts.show_ignored && node.git == Some(GitStatus::Ignored) {
             return false;
+        }
+        if opts.git_clean && (node.git.is_none() || node.git == Some(GitStatus::Ignored)) {
+            return false;
+        }
+        if opts.custom_active && opts.exclude.iter().any(|p| node.name.contains(p.as_str())) {
+            return false;
+        }
+        for set in opts.restricts {
+            if !set.contains(&node.path) {
+                return false;
+            }
         }
         true
     }
+
+    /// All paths (files and dirs) in the loaded tree, for live-filter matching.
+    pub fn all_paths(&self) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        fn walk(n: &Node, out: &mut Vec<(PathBuf, String)>) {
+            for c in &n.children {
+                out.push((c.path.clone(), c.name.clone()));
+                walk(c, out);
+            }
+        }
+        walk(&self.root, &mut out);
+        out
+    }
 }
 
-/// Read a directory and return its children as sorted nodes (dirs first, then
-/// files, each case-insensitive by name). I/O errors yield an empty list.
+fn sort_refs(v: &mut [&Node], mode: SortMode, files_first: bool) {
+    use std::cmp::Ordering;
+    v.sort_by(|a, b| {
+        let ad = a.is_dir();
+        let bd = b.is_dir();
+        if ad != bd {
+            return if files_first {
+                if ad { Ordering::Greater } else { Ordering::Less }
+            } else if ad {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+        match mode {
+            SortMode::Name => by_name(),
+            SortMode::Modified => b.mtime.cmp(&a.mtime).then_with(by_name),
+            SortMode::Extension | SortMode::FileType => {
+                ext_of(&a.name).cmp(&ext_of(&b.name)).then_with(by_name)
+            }
+        }
+    });
+}
+
+fn ext_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map(|(_, e)| e.to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Read a directory and return children as nodes (dirs first, name-sorted).
 pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
     let mut nodes = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -282,7 +436,6 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
 
         let (kind, link_to) = if is_symlink {
             let target = fs::read_link(&path).ok();
-            // metadata() follows the link; meta.is_dir() => points to a dir.
             (NodeKind::Symlink { to_dir: meta.is_dir() }, target)
         } else if meta.is_dir() {
             (NodeKind::Directory, None)
@@ -291,22 +444,16 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
         };
 
         let executable = is_executable(&meta);
-        nodes.push(Node::new(path, kind, executable, link_to));
+        let mut node = Node::new(path, kind, executable, link_to);
+        node.len = if meta.is_file() { meta.len() } else { 0 };
+        node.mtime = meta.modified().ok();
+        nodes.push(node);
     }
-    sort_nodes(&mut nodes);
+    let mut refs: Vec<&Node> = nodes.iter().collect();
+    sort_refs(&mut refs, SortMode::Name, false);
+    let order: Vec<PathBuf> = refs.iter().map(|n| n.path.clone()).collect();
+    nodes.sort_by_key(|n| order.iter().position(|p| p == &n.path).unwrap_or(0));
     nodes
-}
-
-fn sort_nodes(nodes: &mut [Node]) {
-    nodes.sort_by(|a, b| {
-        let a_dir = a.is_dir();
-        let b_dir = b.is_dir();
-        match (a_dir, b_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
-    });
 }
 
 #[cfg(unix)]
@@ -326,11 +473,7 @@ mod tests {
     use std::fs;
 
     fn tmpdir(label: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "treelix-test-{}-{}",
-            std::process::id(),
-            label
-        ));
+        let base = std::env::temp_dir().join(format!("treelix-test-{}-{}", std::process::id(), label));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         base
@@ -341,9 +484,10 @@ mod tests {
         let d = tmpdir("sort");
         fs::create_dir(d.join("zdir")).unwrap();
         fs::write(d.join("afile"), b"x").unwrap();
-        let nodes = read_dir_sorted(&d);
-        assert_eq!(nodes[0].name, "zdir");
-        assert_eq!(nodes[1].name, "afile");
+        let tree = Tree::new(d.clone());
+        let rows = tree.flatten(&ViewOptions::default());
+        assert_eq!(rows[0].name, "zdir");
+        assert_eq!(rows[1].name, "afile");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -353,21 +497,20 @@ mod tests {
         fs::create_dir_all(d.join("sub/inner")).unwrap();
         fs::write(d.join("sub/inner/deep.txt"), b"x").unwrap();
         let mut tree = Tree::new(d.clone());
-        // Initially only top-level visible.
-        let rows = tree.flatten();
+        let opts = ViewOptions::default();
+        let rows = tree.flatten(&opts);
         assert!(rows.iter().any(|r| r.name == "sub"));
         assert!(!rows.iter().any(|r| r.name == "deep.txt"));
 
         let target = d.join("sub/inner/deep.txt");
         assert!(tree.reveal(&target));
-        let rows = tree.flatten();
+        let rows = tree.flatten(&opts);
         assert!(rows.iter().any(|r| r.name == "deep.txt"));
         let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
     fn ignored_filter() {
-        use crate::git::{GitData, GitStatus};
         let d = tmpdir("ignored");
         fs::create_dir(d.join("build")).unwrap();
         fs::write(d.join("keep.txt"), b"x").unwrap();
@@ -375,16 +518,14 @@ mod tests {
 
         let mut statuses = HashMap::new();
         statuses.insert(d.join("build"), GitStatus::Ignored);
-        let data = GitData {
-            toplevel: Some(d.clone()),
-            statuses,
-        };
+        let data = GitData { toplevel: Some(d.clone()), statuses };
         tree.apply_git(&data);
 
-        assert!(!tree.flatten().iter().any(|r| r.name == "build"));
-        assert!(tree.flatten().iter().any(|r| r.name == "keep.txt"));
-        tree.show_ignored = true;
-        assert!(tree.flatten().iter().any(|r| r.name == "build"));
+        let mut opts = ViewOptions::default();
+        assert!(!tree.flatten(&opts).iter().any(|r| r.name == "build"));
+        assert!(tree.flatten(&opts).iter().any(|r| r.name == "keep.txt"));
+        opts.show_ignored = true;
+        assert!(tree.flatten(&opts).iter().any(|r| r.name == "build"));
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -393,10 +534,27 @@ mod tests {
         let d = tmpdir("hidden");
         fs::write(d.join(".secret"), b"x").unwrap();
         fs::write(d.join("visible"), b"x").unwrap();
+        let tree = Tree::new(d.clone());
+        let mut opts = ViewOptions::default();
+        assert!(!tree.flatten(&opts).iter().any(|r| r.name == ".secret"));
+        opts.show_hidden = true;
+        assert!(tree.flatten(&opts).iter().any(|r| r.name == ".secret"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn group_empty_chain() {
+        let d = tmpdir("group");
+        fs::create_dir_all(d.join("a/b/c")).unwrap();
+        fs::write(d.join("a/b/c/file.txt"), b"x").unwrap();
         let mut tree = Tree::new(d.clone());
-        assert!(!tree.flatten().iter().any(|r| r.name == ".secret"));
-        tree.show_hidden = true;
-        assert!(tree.flatten().iter().any(|r| r.name == ".secret"));
+        tree.group_empty = true;
+        tree.expand(&d.join("a"));
+        let opts = ViewOptions { group_empty: true, ..Default::default() };
+        let rows = tree.flatten(&opts);
+        // The a→b→c chain collapses into one row.
+        assert!(rows.iter().any(|r| r.name == "a/b/c"), "rows: {:?}", rows.iter().map(|r| &r.name).collect::<Vec<_>>());
+        assert!(rows.iter().any(|r| r.name == "file.txt"));
         let _ = fs::remove_dir_all(&d);
     }
 }

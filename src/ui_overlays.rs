@@ -16,7 +16,14 @@ pub enum Overlay {
     None,
     Input(InputState),
     Confirm(ConfirmState),
+    Info(InfoState),
     Help,
+}
+
+#[derive(Debug, Clone)]
+pub struct InfoState {
+    pub title: String,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +41,10 @@ pub enum InputKind {
     Rename { path: PathBuf },
     /// Rename only the stem, keeping the extension.
     RenameBasename { path: PathBuf },
+    /// Rename to a full (possibly relative) path.
+    RenameFull { path: PathBuf },
+    /// Search for a node by name (case-insensitive substring).
+    Search,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +57,8 @@ pub struct ConfirmState {
 pub enum ConfirmKind {
     Delete(PathBuf),
     Trash(PathBuf),
+    BulkDelete(Vec<PathBuf>),
+    BulkTrash(Vec<PathBuf>),
 }
 
 /// Render an input prompt as a one-line bordered popup near the bottom.
@@ -79,6 +92,23 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, theme: &Theme, state: &Conf
     frame.render_widget(para, popup);
 }
 
+/// Render a file-info popup.
+pub fn render_info(frame: &mut Frame, area: Rect, theme: &Theme, state: &InfoState) {
+    let popup = centered_rect(area, 60, 50);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.help_title)
+        .title(Span::styled(format!(" {} ", state.title), theme.help_title));
+    let lines: Vec<Line> = state
+        .lines
+        .iter()
+        .map(|l| Line::from(Span::styled(l.clone(), theme.text)))
+        .collect();
+    let para = Paragraph::new(lines).block(block).style(theme.help);
+    frame.render_widget(para, popup);
+}
+
 /// Render the help panel listing the keybindings.
 pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     let popup = centered_rect(area, 64, 90);
@@ -108,23 +138,33 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
 pub const HELP_ENTRIES: &[(&str, &str)] = &[
     ("j / k", "down / up"),
     ("K / J", "first / last sibling"),
+    ("> / <", "next / prev sibling"),
     ("<CR> o", "open file / toggle dir"),
-    ("l", "expand dir"),
-    ("h <BS>", "collapse / parent"),
+    ("l / h", "expand / collapse · parent"),
     ("P", "move cursor to parent"),
     ("C-]", "cd into dir (re-root)"),
     ("-", "re-root to parent"),
     ("E / W", "expand all / collapse all"),
+    ("L", "toggle group-empty dirs"),
+    ("]c [c", "next / prev git change"),
     ("<Tab>", "preview in Helix (no focus)"),
     ("C-v C-x", "open in vsplit / hsplit"),
     ("s", "system open"),
     ("a", "create (trailing / = dir)"),
     ("d <Del>", "delete (confirm)"),
     ("D", "trash"),
-    ("r / e", "rename / rename basename"),
+    ("r e u", "rename / basename / full-path"),
+    ("C-r", "rename omit filename"),
     ("x c p", "cut / copy / paste"),
     ("y Y gy", "copy name / relpath / abspath"),
-    (". / I", "toggle hidden / git-ignored"),
+    ("C-k", "file info"),
+    ("m", "toggle bookmark"),
+    ("bd bt bmv", "bulk delete / trash / move"),
+    ("v / Esc", "select node / clear selection"),
+    ("f / F", "live filter / clear"),
+    ("S", "search node"),
+    (". I C", "toggle hidden / ignored / git-clean"),
+    ("U / B / M", "custom / no-buffer / no-bookmark"),
     ("R", "refresh"),
     ("g?", "this help"),
     ("q", "quit"),

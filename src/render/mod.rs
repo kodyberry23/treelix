@@ -5,3 +5,4 @@ pub mod decorators;
 pub mod icons;
 
 pub use builder::{build_items, root_header, RenderOpts};
+pub use decorators::Decor;

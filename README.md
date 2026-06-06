@@ -56,26 +56,40 @@ Press `g?` inside treelix for the keybinding help panel.
 |---|---|
 | `j` / `k`, arrows | down / up |
 | `K` / `J` | first / last sibling |
+| `>` / `<` | next / previous sibling |
 | `<CR>` / `o` | open file / toggle directory |
-| `l` | expand directory |
-| `h` / `<BS>` | collapse / go to parent |
+| `l` / `h` | expand / collapse · go to parent |
 | `P` | move cursor to parent |
 | `<C-]>` | cd into directory (re-root) |
 | `-` | re-root to parent |
 | `E` / `W` | expand all / collapse all |
+| `L` | toggle group-empty directories |
+| `]c` / `[c` | next / previous git change |
 | `<Tab>` | preview in Helix (keeps focus in treelix) |
 | `<C-v>` / `<C-x>` | open in vsplit / hsplit |
 | `s` | system open |
 | `a` | create (trailing `/` = directory) |
 | `d` / `<Del>` | delete (confirm) |
 | `D` | trash |
-| `r` / `e` | rename / rename basename |
+| `r` / `e` / `u` | rename / rename basename / rename full path |
+| `<C-r>` | rename omitting filename |
 | `x` / `c` / `p` | cut / copy / paste |
 | `y` / `Y` / `gy` | copy filename / relative path / absolute path |
-| `.` / `I` | toggle hidden / git-ignored |
+| `<C-k>` | file info popup |
+| `m` | toggle bookmark |
+| `bd` / `bt` / `bmv` | bulk delete / trash / move bookmarked |
+| `v` / `Esc` | select node (multi-select) / clear selection |
+| `f` / `F` | live filter start / clear |
+| `S` | search node by name |
+| `.` / `I` / `C` | toggle hidden / git-ignored / git-clean |
+| `U` / `B` / `M` | toggle custom / no-buffer / no-bookmark filter |
 | `R` | refresh |
 | `g?` | help |
 | `q` | quit |
+
+Selection-aware ops: when nodes are multi-selected with `v`, the delete / trash /
+cut / copy actions operate on the whole selection. Bulk `bd` / `bt` / `bmv` act on
+bookmarked nodes (`m`).
 
 ## Configuration
 
@@ -84,8 +98,16 @@ Optional `~/.config/treelix/config.toml`:
 ```toml
 theme = "nord-aurora"   # a treelix theme name, or "helix" to derive from Helix
 icons = true            # Nerd Font glyphs (false → ASCII fallbacks)
+arrows = false          # show expand/collapse arrows before folder icons
 show_hidden = false
 show_ignored = false
+sort = "name"           # name | modified | extension | filetype
+files_first = false     # place files before directories
+group_empty = false     # collapse chains of sole-child dirs into one line
+mouse = true            # click to open/cd, scroll to move
+bookmarks_persist = false   # persist bookmarks to ~/.config/treelix/bookmarks
+exclude = []            # substring patterns hidden when custom filter (U) is on
+# special_files = ["cargo.toml", "makefile", "readme.md", ...]   # highlighted
 # open_command = "~/projects/helix-files/scripts/dispatch-to-editor.sh {mode} {path}"
 ```
 
@@ -108,25 +130,28 @@ treelix performs the same dispatch itself, resolving the socket from
 
 ## Roadmap
 
-Built today (core): tree render, git status, auto-reload, file ops, open-in-
-Helix, reveal IPC, theming, hidden/ignored filters.
+**Implemented:** tree render with icons/indent guides, git status (+ folder
+propagation), auto-reload/file-watching, full file ops, open-in-Helix
+(vsplit/hsplit/preview/system), reveal IPC, theming + Helix-theme import,
+hidden/ignored/git-clean/custom/no-buffer/no-bookmark filters, live filter
+(`f`/`F`) and search (`S`) via `nucleo`, sort modes + files-first, group-empty
+dirs (`L`), git navigation (`[c`/`]c`), sibling navigation (`>`/`<`),
+marks/bookmarks (`m`,`M`,`bd`,`bt`,`bmv`, with persistence), visual multi-select
+bulk ops, rename variants (`r`/`e`/`u`/`<C-r>`), file-info popup (`<C-k>`),
+special-file highlighting, current-file highlight, and mouse support.
 
-**Phase 2 (full nvim-tree parity), not yet implemented:**
+**Helix-aware** (the open-file highlight, `no_buffer` filter, and follow-on-reveal
+work by Helix telling treelix its current buffer over the reveal socket — see the
+[helix-files](https://github.com/kodyberry23/helix-files) integration).
 
-- Marks / bookmarks (`m`, `M`, `bd`, `bt`, `bmv`) with persistence
-- Live filter (`f` / `F`) and search-node (`S`) via `nucleo`
-- Sort modes (mtime / extension / filetype, files-first)
-- Group empty directories (`L`)
-- Git navigation (`[c` / `]c`) and git-clean filter (`C`)
-- Window picker (`O`), new-tab (`<C-t>`)
-- Visual-mode multi-select bulk operations
-- File-info popup (`<C-k>`), run-command (`.`), custom filter (`U`)
-- Symlink-destination display toggle, special-file highlighting
-
-**Not feasible standalone** (depend on the editor's LSP / buffer state):
+**Not feasible standalone** (depend on the editor's LSP / live buffer set):
 
 - Diagnostics column (`]e` / `[e`, severity icons) — needs Helix's LSP state.
-- `no_buffer` filter (`B`) and modified indicator — need Helix's buffer list.
+- Window picker (`O`), open-in-place (`<C-e>`), new-tab (`<C-t>`), float window —
+  Neovim window/buffer concepts with no standalone analog.
+- True modified indicator and a complete `no_buffer` set require Helix's full
+  buffer list; treelix approximates `no_buffer` with the files it has opened/
+  revealed this session.
 
 ## License
 

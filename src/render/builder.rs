@@ -3,10 +3,10 @@
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListItem;
 
-use crate::clipboard::Clipboard;
 use crate::theme::Theme;
 use crate::tree::{NodeKind, Row};
 
+use super::decorators::Decor;
 use super::{decorators, icons};
 
 pub struct RenderOpts {
@@ -19,19 +19,14 @@ pub fn build_items<'a>(
     rows: &[Row],
     theme: &Theme,
     opts: &RenderOpts,
-    clipboard: &Clipboard,
+    decor: &Decor,
 ) -> Vec<ListItem<'a>> {
     rows.iter()
-        .map(|row| ListItem::new(build_line(row, theme, opts, clipboard)))
+        .map(|row| ListItem::new(build_line(row, theme, opts, decor)))
         .collect()
 }
 
-fn build_line<'a>(
-    row: &Row,
-    theme: &Theme,
-    opts: &RenderOpts,
-    clipboard: &Clipboard,
-) -> Line<'a> {
+fn build_line<'a>(row: &Row, theme: &Theme, opts: &RenderOpts, decor: &Decor) -> Line<'a> {
     let mut spans: Vec<Span<'a>> = Vec::new();
 
     // Indent markers. The last entry of `ancestor_last` is this node's own
@@ -69,8 +64,14 @@ fn build_line<'a>(
     }
 
     // Name.
-    let name_style = decorators::name_style(row, theme, clipboard);
+    let name_style = decorators::name_style(row, theme, decor);
     spans.push(Span::styled(row.name.clone(), name_style));
+
+    // Bookmark glyph.
+    if decor.marks.contains(&row.path) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(icons::BOOKMARK.to_string(), theme.bookmark));
+    }
 
     // Symlink destination.
     if let Some(target) = &row.link_to {
@@ -145,10 +146,12 @@ fn shorten_home(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::Clipboard;
     use crate::tree::Row;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::List;
     use ratatui::Terminal;
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     #[test]
@@ -171,7 +174,7 @@ mod tests {
             executable: false,
             git: None,
             link_to: None,
-            is_last: ancestor_last.last().copied().unwrap_or(false),
+            group_target: None,
             ancestor_last,
         }
     }
@@ -185,7 +188,16 @@ mod tests {
         let theme = Theme::default();
         let opts = RenderOpts { icons_enabled: false, show_arrows: false };
         let clipboard = Clipboard::default();
-        let items = build_items(&rows, &theme, &opts, &clipboard);
+        let marks = HashSet::new();
+        let selection = HashSet::new();
+        let decor = Decor {
+            clipboard: &clipboard,
+            marks: &marks,
+            selection: &selection,
+            current_file: None,
+            special_files: &[],
+        };
+        let items = build_items(&rows, &theme, &opts, &decor);
 
         let backend = TestBackend::new(30, 4);
         let mut terminal = Terminal::new(backend).unwrap();
