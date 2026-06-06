@@ -1,6 +1,6 @@
 [package]
 name = "treelix"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "An nvim-tree-style terminal file explorer for the Helix editor, written in Rust"
 license = "MIT"
