@@ -109,16 +109,20 @@ pub fn render_info(frame: &mut Frame, area: Rect, theme: &Theme, state: &InfoSta
     frame.render_widget(para, popup);
 }
 
-/// Render the help panel listing the keybindings.
+/// Render the help panel listing the keybindings. Fills the entire pane
+/// (rather than floating) since the sidebar is typically narrow; any key
+/// dismisses it and restores the previous view.
 pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let popup = centered_rect(area, 64, 90);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.help_title)
-        .title(Span::styled(" treelix — keybindings ", theme.help_title));
+    frame.render_widget(Clear, area);
+    // Paint the whole pane with the help background first.
+    frame.render_widget(Block::default().style(theme.help), area);
 
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " treelix — keybindings ",
+        theme.help_title,
+    )));
+    lines.push(Line::from(""));
     for (key, desc) in HELP_ENTRIES {
         lines.push(Line::from(vec![
             Span::styled(
@@ -134,8 +138,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         theme.indent_marker,
     )));
 
-    let para = Paragraph::new(lines).block(block).style(theme.help);
-    frame.render_widget(para, popup);
+    let para = Paragraph::new(lines).style(theme.help);
+    frame.render_widget(para, area);
 }
 
 pub const HELP_ENTRIES: &[(&str, &str)] = &[
