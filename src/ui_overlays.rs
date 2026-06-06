@@ -121,7 +121,10 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
     for (key, desc) in HELP_ENTRIES {
         lines.push(Line::from(vec![
-            Span::styled(format!("{key:<8}"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{key:<8}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(*desc, theme.text),
         ]));
     }

@@ -228,7 +228,8 @@ pub mod helix {
         };
 
         let mut theme = Theme::default();
-        let style_of = |c: Option<Color>, base: Style| c.map(|c| Style::default().fg(c)).unwrap_or(base);
+        let style_of =
+            |c: Option<Color>, base: Style| c.map(|c| Style::default().fg(c)).unwrap_or(base);
 
         if let Some(c) = scope_fg("ui.text") {
             theme.text = Style::default().fg(c);
@@ -236,8 +237,8 @@ pub mod helix {
         }
         // Helix has no Directory scope; `function` reads as the cyan accent in
         // typical themes (and matches the old broot sidebar look).
-        theme.directory = style_of(scope_fg("function"), theme.directory)
-            .add_modifier(Modifier::BOLD);
+        theme.directory =
+            style_of(scope_fg("function"), theme.directory).add_modifier(Modifier::BOLD);
         theme.folder_icon = style_of(scope_fg("function"), theme.folder_icon);
         theme.root = style_of(scope_fg("ui.text.focus"), theme.root).add_modifier(Modifier::BOLD);
         theme.indent_marker = style_of(scope_fg("comment"), theme.indent_marker);
@@ -252,12 +253,17 @@ pub mod helix {
         theme.git_untracked = style_of(scope_fg("special"), theme.git_untracked);
         theme.git_ignored = style_of(scope_fg("comment"), theme.git_ignored);
         theme.special = style_of(scope_fg("constant"), theme.special).add_modifier(Modifier::BOLD);
-        theme.opened = style_of(scope_fg("ui.text.focus"), theme.opened).add_modifier(Modifier::BOLD);
+        theme.opened =
+            style_of(scope_fg("ui.text.focus"), theme.opened).add_modifier(Modifier::BOLD);
         theme.bookmark = style_of(scope_fg("keyword"), theme.bookmark);
         theme.filter_prefix = style_of(scope_fg("keyword"), theme.filter_prefix);
         // Selection: use ui.selection bg.
         if let Some(t) = theme_value.get("ui.selection").and_then(|v| v.as_table()) {
-            if let Some(c) = t.get("bg").and_then(|b| b.as_str()).and_then(|s| resolve_color(s, &palette)) {
+            if let Some(c) = t
+                .get("bg")
+                .and_then(|b| b.as_str())
+                .and_then(|s| resolve_color(s, &palette))
+            {
                 theme.selection = Style::default().bg(c);
             }
         }
@@ -295,8 +301,7 @@ pub mod helix {
             return Some(PathBuf::from(rt).join("themes"));
         }
         // Common build-from-source location used by the user's setup.
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("projects/helix/runtime/themes"))
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("projects/helix/runtime/themes"))
     }
 
     /// Child keys override parent keys.

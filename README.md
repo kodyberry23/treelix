@@ -34,12 +34,27 @@ It was built to replace [broot](https://dystroy.org/broot/) as the file sidebar.
 
 ## Install
 
-Requires a Rust toolchain and a Nerd Font.
+Requires a Nerd Font. Build from source (needs a Rust toolchain):
 
 ```sh
 git clone https://github.com/kodyberry23/treelix ~/projects/treelix
 cargo install --path ~/projects/treelix   # installs `treelix` into ~/.cargo/bin
 ```
+
+Or grab a prebuilt macOS binary from the [latest release](https://github.com/kodyberry23/treelix/releases/latest):
+
+```sh
+arch=$(uname -m | sed 's/arm64/aarch64/')   # aarch64 or x86_64
+curl -fsSL "https://github.com/kodyberry23/treelix/releases/latest/download/treelix-${arch}-apple-darwin.tar.gz" \
+  | tar -xz
+install "treelix-${arch}-apple-darwin/treelix" ~/.cargo/bin/   # or anywhere on PATH
+```
+
+### Releases
+
+Tagged releases (`vX.Y.Z`) build and publish macOS `aarch64`/`x86_64` binaries via
+GitHub Actions. To cut one: bump `version` in `Cargo.toml`, then
+`git tag vX.Y.Z && git push --tags` (the tag must match the Cargo.toml version).
 
 ## Usage
 

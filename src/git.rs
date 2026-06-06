@@ -179,7 +179,10 @@ mod tests {
         // " M file.txt\0?? new.rs\0"
         let buf = b" M file.txt\0?? new.rs\0";
         parse_porcelain_z(buf, top, &mut map);
-        assert_eq!(map.get(Path::new("/repo/file.txt")), Some(&GitStatus::Dirty));
+        assert_eq!(
+            map.get(Path::new("/repo/file.txt")),
+            Some(&GitStatus::Dirty)
+        );
         assert_eq!(
             map.get(Path::new("/repo/new.rs")),
             Some(&GitStatus::Untracked)

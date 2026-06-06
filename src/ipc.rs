@@ -51,7 +51,10 @@ pub fn serve(sender: Sender<PathBuf>) -> Option<SocketGuard> {
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("treelix: could not bind reveal socket {}: {e}", path.display());
+            eprintln!(
+                "treelix: could not bind reveal socket {}: {e}",
+                path.display()
+            );
             return None;
         }
     };

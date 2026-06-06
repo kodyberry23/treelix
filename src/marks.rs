@@ -64,8 +64,11 @@ impl Marks {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let mut lines: Vec<String> =
-                self.set.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let mut lines: Vec<String> = self
+                .set
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             lines.sort();
             let _ = std::fs::write(p, lines.join("\n"));
         }

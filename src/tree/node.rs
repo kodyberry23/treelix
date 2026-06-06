@@ -11,7 +11,9 @@ pub enum NodeKind {
     File,
     Directory,
     /// Symlink; `to_dir` is true when it resolves to a directory.
-    Symlink { to_dir: bool },
+    Symlink {
+        to_dir: bool,
+    },
 }
 
 impl NodeKind {

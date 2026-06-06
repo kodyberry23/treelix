@@ -112,9 +112,7 @@ pub fn resolve(key: KeyEvent, pending: &str) -> (Action, String) {
 
         KeyCode::Enter | KeyCode::Char('o') => (Action::OpenOrToggle, none),
         KeyCode::Char('l') | KeyCode::Right => (Action::Expand, none),
-        KeyCode::Char('h') | KeyCode::Backspace | KeyCode::Left => {
-            (Action::CollapseOrParent, none)
-        }
+        KeyCode::Char('h') | KeyCode::Backspace | KeyCode::Left => (Action::CollapseOrParent, none),
         KeyCode::Char('P') => (Action::CursorParent, none),
         KeyCode::Char('-') => (Action::RootParent, none),
         KeyCode::Char('E') => (Action::ExpandAll, none),

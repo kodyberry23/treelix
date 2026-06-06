@@ -296,11 +296,17 @@ impl Tree {
         out
     }
 
-    fn emit(&self, node: &Node, ancestor_last: &mut Vec<bool>, opts: &ViewOptions, out: &mut Vec<Row>) {
+    fn emit(
+        &self,
+        node: &Node,
+        ancestor_last: &mut Vec<bool>,
+        opts: &ViewOptions,
+        out: &mut Vec<Row>,
+    ) {
         let (name, deepest) = self.group_chain(node, opts);
         let depth = ancestor_last.len().saturating_sub(1);
-        let has_children =
-            deepest.is_dir() && (!deepest.loaded || deepest.children.iter().any(|c| self.is_visible(c, opts)));
+        let has_children = deepest.is_dir()
+            && (!deepest.loaded || deepest.children.iter().any(|c| self.is_visible(c, opts)));
         let group_target = if deepest.path != node.path {
             Some(deepest.path.clone())
         } else {
@@ -350,7 +356,11 @@ impl Tree {
     }
 
     fn visible_sorted<'t>(&'t self, dir: &'t Node, opts: &ViewOptions) -> Vec<&'t Node> {
-        let mut v: Vec<&Node> = dir.children.iter().filter(|c| self.is_visible(c, opts)).collect();
+        let mut v: Vec<&Node> = dir
+            .children
+            .iter()
+            .filter(|c| self.is_visible(c, opts))
+            .collect();
         sort_refs(&mut v, opts.sort, opts.files_first);
         v
     }
@@ -397,7 +407,11 @@ fn sort_refs(v: &mut [&Node], mode: SortMode, files_first: bool) {
         let bd = b.is_dir();
         if ad != bd {
             return if files_first {
-                if ad { Ordering::Greater } else { Ordering::Less }
+                if ad {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
             } else if ad {
                 Ordering::Less
             } else {
@@ -432,11 +446,16 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
         let symlink_meta = fs::symlink_metadata(&path).ok();
-        let is_symlink = symlink_meta.as_ref().map_or(false, |m| m.is_symlink());
+        let is_symlink = symlink_meta.as_ref().is_some_and(|m| m.is_symlink());
 
         let (kind, link_to) = if is_symlink {
             let target = fs::read_link(&path).ok();
-            (NodeKind::Symlink { to_dir: meta.is_dir() }, target)
+            (
+                NodeKind::Symlink {
+                    to_dir: meta.is_dir(),
+                },
+                target,
+            )
         } else if meta.is_dir() {
             (NodeKind::Directory, None)
         } else {
@@ -473,7 +492,8 @@ mod tests {
     use std::fs;
 
     fn tmpdir(label: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!("treelix-test-{}-{}", std::process::id(), label));
+        let base =
+            std::env::temp_dir().join(format!("treelix-test-{}-{}", std::process::id(), label));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         base
@@ -518,7 +538,10 @@ mod tests {
 
         let mut statuses = HashMap::new();
         statuses.insert(d.join("build"), GitStatus::Ignored);
-        let data = GitData { toplevel: Some(d.clone()), statuses };
+        let data = GitData {
+            toplevel: Some(d.clone()),
+            statuses,
+        };
         tree.apply_git(&data);
 
         let mut opts = ViewOptions::default();
@@ -550,10 +573,17 @@ mod tests {
         let mut tree = Tree::new(d.clone());
         tree.group_empty = true;
         tree.expand(&d.join("a"));
-        let opts = ViewOptions { group_empty: true, ..Default::default() };
+        let opts = ViewOptions {
+            group_empty: true,
+            ..Default::default()
+        };
         let rows = tree.flatten(&opts);
         // The a→b→c chain collapses into one row.
-        assert!(rows.iter().any(|r| r.name == "a/b/c"), "rows: {:?}", rows.iter().map(|r| &r.name).collect::<Vec<_>>());
+        assert!(
+            rows.iter().any(|r| r.name == "a/b/c"),
+            "rows: {:?}",
+            rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
         assert!(rows.iter().any(|r| r.name == "file.txt"));
         let _ = fs::remove_dir_all(&d);
     }

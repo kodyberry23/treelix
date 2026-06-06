@@ -376,7 +376,9 @@ impl App {
     // ── Overlay input ─────────────────────────────────────────────────────────
 
     fn on_input_key(&mut self, key: KeyEvent) {
-        let Overlay::Input(state) = &mut self.overlay else { return };
+        let Overlay::Input(state) = &mut self.overlay else {
+            return;
+        };
         match key.code {
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Enter => {
@@ -393,7 +395,9 @@ impl App {
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) {
-        let Overlay::Confirm(state) = &self.overlay else { return };
+        let Overlay::Confirm(state) = &self.overlay else {
+            return;
+        };
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let kind = state.kind.clone();
@@ -484,13 +488,19 @@ impl App {
                 let n = paths.len();
                 self.marks.remove_all(&paths);
                 self.selection.clear();
-                paths.iter().try_for_each(|p| crate::tree::ops::remove(p)).map(|_| n)
+                paths
+                    .iter()
+                    .try_for_each(|p| crate::tree::ops::remove(p))
+                    .map(|_| n)
             }
             ConfirmKind::BulkTrash(paths) => {
                 let n = paths.len();
                 self.marks.remove_all(&paths);
                 self.selection.clear();
-                paths.iter().try_for_each(|p| crate::tree::ops::trash(p)).map(|_| n)
+                paths
+                    .iter()
+                    .try_for_each(|p| crate::tree::ops::trash(p))
+                    .map(|_| n)
             }
         };
         match result {
@@ -505,7 +515,9 @@ impl App {
     // ── Open / navigate ───────────────────────────────────────────────────────
 
     fn open_or_toggle(&mut self) {
-        let Some(row) = self.current_row().cloned() else { return };
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
         if row.kind.is_dir() {
             self.tree.toggle(&row.path);
             self.tree.apply_git(&self.git);
@@ -531,7 +543,9 @@ impl App {
     }
 
     fn expand_current(&mut self) {
-        let Some(row) = self.current_row().cloned() else { return };
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
         if row.kind.is_dir() && !row.expanded {
             self.tree.expand(&row.path);
             self.tree.apply_git(&self.git);
@@ -542,7 +556,9 @@ impl App {
     }
 
     fn collapse_or_parent(&mut self) {
-        let Some(row) = self.current_row().cloned() else { return };
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
         if row.kind.is_dir() && row.expanded {
             self.tree.collapse(&row.path);
             self.refresh_rows(Some(row.path));
@@ -597,17 +613,23 @@ impl App {
     }
 
     fn start_rename(&mut self, kind: RenameKind) {
-        let Some(row) = self.current_row().cloned() else { return };
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
         let (prompt, buffer, ikind) = match kind {
             RenameKind::Basename => (
                 " rename basename ",
                 stem(&row.name),
-                InputKind::RenameBasename { path: row.path.clone() },
+                InputKind::RenameBasename {
+                    path: row.path.clone(),
+                },
             ),
             RenameKind::Basename2Full => (
                 " rename ",
                 row.name.clone(),
-                InputKind::Rename { path: row.path.clone() },
+                InputKind::Rename {
+                    path: row.path.clone(),
+                },
             ),
             RenameKind::Full => {
                 let rel = row
@@ -616,7 +638,13 @@ impl App {
                     .unwrap_or(&row.path)
                     .to_string_lossy()
                     .into_owned();
-                (" rename full path ", rel, InputKind::RenameFull { path: row.path.clone() })
+                (
+                    " rename full path ",
+                    rel,
+                    InputKind::RenameFull {
+                        path: row.path.clone(),
+                    },
+                )
             }
             RenameKind::OmitFilename => {
                 // Pre-fill the relative directory, keeping the filename fixed.
@@ -626,14 +654,20 @@ impl App {
                     .and_then(|p| p.strip_prefix(&self.tree.root.path).ok())
                     .map(|p| {
                         let s = p.to_string_lossy();
-                        if s.is_empty() { String::new() } else { format!("{s}/") }
+                        if s.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{s}/")
+                        }
                     })
                     .unwrap_or_default();
                 let fname = file_name(&row.path);
                 (
                     " rename (dir only) ",
                     format!("{rel_dir}{fname}"),
-                    InputKind::RenameFull { path: row.path.clone() },
+                    InputKind::RenameFull {
+                        path: row.path.clone(),
+                    },
                 )
             }
         };
@@ -653,7 +687,11 @@ impl App {
         let (prompt, kind) = if targets.len() == 1 {
             let p = targets[0].clone();
             let name = file_name(&p);
-            let kind = if trash { ConfirmKind::Trash(p) } else { ConfirmKind::Delete(p) };
+            let kind = if trash {
+                ConfirmKind::Trash(p)
+            } else {
+                ConfirmKind::Delete(p)
+            };
             (format!("{verb} {name}?"), kind)
         } else {
             let kind = if trash {
@@ -710,7 +748,9 @@ impl App {
     }
 
     fn copy_path_kind(&mut self, kind: PathKind) {
-        let Some(row) = self.current_row().cloned() else { return };
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
         let text = match kind {
             PathKind::Filename => row.name.clone(),
             PathKind::Relative => row
@@ -726,7 +766,9 @@ impl App {
     }
 
     fn file_info(&mut self) {
-        let Some(row) = self.current_row().cloned() else { return };
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
         let mut lines = vec![format!("path: {}", row.path.display())];
         if let Ok(meta) = std::fs::symlink_metadata(&row.path) {
             let kind = if meta.is_dir() {
@@ -863,7 +905,11 @@ impl App {
                 ("bookmarked only", self.no_bookmark)
             }
         };
-        self.status = Some(format!("{}: {}", label.0, if label.1 { "on" } else { "off" }));
+        self.status = Some(format!(
+            "{}: {}",
+            label.0,
+            if label.1 { "on" } else { "off" }
+        ));
         self.refresh_rows(self.selected_path());
     }
 
@@ -993,7 +1039,10 @@ impl App {
         let pat = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
         let mut buf = Vec::new();
         for (path, name) in all {
-            if pat.score(Utf32Str::new(&name, &mut buf), &mut self.matcher).is_some() {
+            if pat
+                .score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
+                .is_some()
+            {
                 set.insert(path.clone());
                 let mut cur = path.as_path();
                 while let Some(parent) = cur.parent() {
@@ -1074,7 +1123,9 @@ impl App {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.depth == cur.depth && r.path.parent().map(Path::to_path_buf) == parent)
+            .filter(|(_, r)| {
+                r.depth == cur.depth && r.path.parent().map(Path::to_path_buf) == parent
+            })
             .map(|(i, _)| i)
             .collect();
         let cur_idx = self.list_state.selected().unwrap_or(0);
@@ -1083,7 +1134,11 @@ impl App {
 
     fn jump_sibling_edge(&mut self, first: bool) {
         let (indices, _) = self.sibling_indices();
-        let target = if first { indices.first() } else { indices.last() };
+        let target = if first {
+            indices.first()
+        } else {
+            indices.last()
+        };
         if let Some(&i) = target {
             self.list_state.select(Some(i));
         }

@@ -1,0 +1,68 @@
+name: release
+
+# Tag a release to build macOS binaries and publish them:
+#   1. bump `version` in Cargo.toml (e.g. 0.2.0)
+#   2. git commit -am "release: v0.2.0" && git tag v0.2.0
+#   3. git push && git push --tags
+# The tag must match the Cargo.toml version (enforced below).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "tag=$tag cargo=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          dist="treelix-${{ matrix.target }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/treelix" "$dist/"
+          cp README.md LICENSE "$dist/" 2>/dev/null || true
+          tar -czf "$dist.tar.gz" "$dist"
+          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            treelix-${{ matrix.target }}.tar.gz
+            treelix-${{ matrix.target }}.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

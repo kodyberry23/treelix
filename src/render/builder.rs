@@ -41,7 +41,11 @@ fn build_line<'a>(row: &Row, theme: &Theme, opts: &RenderOpts, decor: &Decor) ->
     // Optional expand/collapse arrow for directories.
     if opts.show_arrows && is_dir && row.has_children {
         let arrow = if opts.icons_enabled {
-            if row.expanded { icons::ARROW_OPEN } else { icons::ARROW_CLOSED }
+            if row.expanded {
+                icons::ARROW_OPEN
+            } else {
+                icons::ARROW_CLOSED
+            }
         } else if row.expanded {
             icons::ascii::ARROW_OPEN
         } else {
@@ -186,7 +190,10 @@ mod tests {
             row("README.md", NodeKind::File, vec![true]),
         ];
         let theme = Theme::default();
-        let opts = RenderOpts { icons_enabled: false, show_arrows: false };
+        let opts = RenderOpts {
+            icons_enabled: false,
+            show_arrows: false,
+        };
         let clipboard = Clipboard::default();
         let marks = HashSet::new();
         let selection = HashSet::new();

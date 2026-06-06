@@ -57,6 +57,8 @@ pub fn watch(root: PathBuf, sender: Sender<()>) -> Option<RecommendedWatcher> {
 fn is_ignored(path: &Path) -> bool {
     path.components().any(|c| {
         let s = c.as_os_str();
-        IGNORE_COMPONENTS.iter().any(|ig| s == std::ffi::OsStr::new(ig))
+        IGNORE_COMPONENTS
+            .iter()
+            .any(|ig| s == std::ffi::OsStr::new(ig))
     })
 }

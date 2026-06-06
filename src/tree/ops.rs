@@ -88,7 +88,11 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Compute a non-colliding destination path inside `dest_dir` for `src`.
 pub fn paste_target(dest_dir: &Path, src: &Path) -> PathBuf {
-    let name = src.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = src
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let mut candidate = dest_dir.join(&name);
     if !candidate.exists() {
         return candidate;

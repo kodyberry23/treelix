@@ -94,7 +94,15 @@ fn internal_dispatch(abs: &Path, mode: OpenMode) {
     // Fallback: spawn a fresh helix pane (in zellij) or a bare `hx`.
     if std::env::var_os("ZELLIJ").is_some() {
         let _ = Command::new("zellij")
-            .args(["action", "new-pane", "--direction", "right", "--name", "editor", "--"])
+            .args([
+                "action",
+                "new-pane",
+                "--direction",
+                "right",
+                "--name",
+                "editor",
+                "--",
+            ])
             .arg("hx")
             .arg(abs)
             .status();
@@ -177,7 +185,13 @@ pub fn session_name() -> String {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
