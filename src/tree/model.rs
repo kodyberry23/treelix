@@ -386,12 +386,14 @@ impl Tree {
         true
     }
 
-    /// All paths (files and dirs) in the loaded tree, for live-filter matching.
-    pub fn all_paths(&self) -> Vec<(PathBuf, String)> {
+    /// All paths in the loaded tree, for live-filter matching. Each entry is
+    /// `(path, name, is_dir)`; `is_dir` lets the filter keep folders visible
+    /// (nvim-tree's `always_show_folders`) while matching only files by name.
+    pub fn all_paths(&self) -> Vec<(PathBuf, String, bool)> {
         let mut out = Vec::new();
-        fn walk(n: &Node, out: &mut Vec<(PathBuf, String)>) {
+        fn walk(n: &Node, out: &mut Vec<(PathBuf, String, bool)>) {
             for c in &n.children {
-                out.push((c.path.clone(), c.name.clone()));
+                out.push((c.path.clone(), c.name.clone(), c.is_dir()));
                 walk(c, out);
             }
         }
@@ -446,19 +448,18 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // `file_type()` is cheap on macOS/Linux (uses the dirent d_type, no
+        // stat). `entry.metadata()` is an lstat (does not follow symlinks), so a
+        // single call covers size/mtime/permissions for the entry itself; only
+        // symlinks need an extra stat to learn whether the target is a dir.
+        let Ok(ft) = entry.file_type() else { continue };
         let Ok(meta) = entry.metadata() else { continue };
-        let symlink_meta = fs::symlink_metadata(&path).ok();
-        let is_symlink = symlink_meta.as_ref().is_some_and(|m| m.is_symlink());
 
-        let (kind, link_to) = if is_symlink {
+        let (kind, link_to) = if ft.is_symlink() {
             let target = fs::read_link(&path).ok();
-            (
-                NodeKind::Symlink {
-                    to_dir: meta.is_dir(),
-                },
-                target,
-            )
-        } else if meta.is_dir() {
+            let to_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+            (NodeKind::Symlink { to_dir }, target)
+        } else if ft.is_dir() {
             (NodeKind::Directory, None)
         } else {
             (NodeKind::File, None)
@@ -466,7 +467,7 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
 
         let executable = is_executable(&meta);
         let mut node = Node::new(path, kind, executable, link_to);
-        node.len = if meta.is_file() { meta.len() } else { 0 };
+        node.len = if ft.is_file() { meta.len() } else { 0 };
         node.mtime = meta.modified().ok();
         nodes.push(node);
     }

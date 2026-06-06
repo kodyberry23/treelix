@@ -53,7 +53,6 @@ pub enum Action {
     BulkMove,
     // Filters / view
     ToggleHidden,
-    ToggleIgnored,
     ToggleGitClean,
     ToggleCustom,
     ToggleNoBuffer,
@@ -136,8 +135,8 @@ pub fn resolve(key: KeyEvent, pending: &str) -> (Action, String) {
 
         KeyCode::Char('m') => (Action::ToggleMark, none),
 
+        // `.` reveals both dotfiles and git-ignored entries (a single toggle).
         KeyCode::Char('.') => (Action::ToggleHidden, none),
-        KeyCode::Char('I') => (Action::ToggleIgnored, none),
         KeyCode::Char('C') => (Action::ToggleGitClean, none),
         KeyCode::Char('U') => (Action::ToggleCustom, none),
         KeyCode::Char('B') => (Action::ToggleNoBuffer, none),

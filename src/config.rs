@@ -28,6 +28,10 @@ pub struct Config {
     pub mouse: bool,
     /// Persist bookmarks to `~/.config/treelix/bookmarks`.
     pub bookmarks_persist: bool,
+    /// Keep folders visible during a live filter (`f`), matching only files by
+    /// name — nvim-tree's `live_filter.always_show_folders`. Set false to also
+    /// hide non-matching folders.
+    pub live_filter_show_folders: bool,
     /// Substring patterns hidden when the custom filter (`U`) is active.
     pub exclude: Vec<String>,
     /// Filenames (lowercase) highlighted as "special".
@@ -51,6 +55,7 @@ impl Default for Config {
             group_empty: false,
             mouse: true,
             bookmarks_persist: false,
+            live_filter_show_folders: true,
             exclude: Vec::new(),
             special_files: default_special_files(),
             open_command: None,

@@ -93,10 +93,12 @@ Press `?` (or `g?`) inside treelix for the keybinding help panel.
 | `<C-k>` | file info popup |
 | `m` | toggle bookmark |
 | `bd` / `bt` / `bmv` | bulk delete / trash / move bookmarked |
-| `v` / `Esc` | select node (multi-select) / clear selection |
+| `v` | select node (multi-select) |
 | `f` / `F` | live filter start / clear |
+| `Esc` | clear active filter, then selection, then pending keys |
 | `S` | search node by name |
-| `.` / `I` / `C` | toggle hidden / git-ignored / git-clean |
+| `.` | toggle hidden **and** git-ignored (one combined toggle) |
+| `C` | toggle git-clean (changed only) |
 | `U` / `B` / `M` | toggle custom / no-buffer / no-bookmark filter |
 | `R` | refresh |
 | `?` / `g?` | help |
@@ -106,6 +108,12 @@ Selection-aware ops: when nodes are multi-selected with `v`, the delete / trash 
 cut / copy actions operate on the whole selection. Bulk `bd` / `bt` / `bmv` act on
 bookmarked nodes (`m`).
 
+Live filter (`f`): matches **files** by name while keeping folders visible so the
+tree stays navigable (nvim-tree's `always_show_folders`; set
+`live_filter_show_folders = false` to also hide non-matching folders). Like
+nvim-tree, it searches only nodes that are currently loaded — press `E`
+(expand-all) first to filter across the whole tree. `Esc` or `F` clears it.
+
 ## Configuration
 
 Optional `~/.config/treelix/config.toml`:
@@ -114,13 +122,14 @@ Optional `~/.config/treelix/config.toml`:
 theme = "nord-aurora"   # a treelix theme name, or "helix" to derive from Helix
 icons = true            # Nerd Font glyphs (false → ASCII fallbacks)
 arrows = false          # show expand/collapse arrows before folder icons
-show_hidden = false
-show_ignored = false
+show_hidden = false     # initial state of dotfiles (`.` toggles this + ignored)
+show_ignored = false    # initial state of git-ignored entries
 sort = "name"           # name | modified | extension | filetype
 files_first = false     # place files before directories
 group_empty = false     # collapse chains of sole-child dirs into one line
 mouse = true            # click to open/cd, scroll to move
 bookmarks_persist = false   # persist bookmarks to ~/.config/treelix/bookmarks
+live_filter_show_folders = true   # keep folders visible during `f` (filter files only)
 exclude = []            # substring patterns hidden when custom filter (U) is on
 # special_files = ["cargo.toml", "makefile", "readme.md", ...]   # highlighted
 # open_command = "~/projects/helix-files/scripts/dispatch-to-editor.sh {mode} {path}"

@@ -332,7 +332,6 @@ impl App {
             Action::BulkTrash => self.bulk_remove(true),
             Action::BulkMove => self.bulk_move(),
             Action::ToggleHidden => self.toggle_filter(Filter::Hidden),
-            Action::ToggleIgnored => self.toggle_filter(Filter::Ignored),
             Action::ToggleGitClean => self.toggle_filter(Filter::GitClean),
             Action::ToggleCustom => self.toggle_filter(Filter::Custom),
             Action::ToggleNoBuffer => self.toggle_filter(Filter::NoBuffer),
@@ -362,12 +361,21 @@ impl App {
             Action::Help => self.overlay = Overlay::Help,
             Action::ToggleSelect => self.toggle_select(),
             Action::ClearSelect => {
-                if !self.selection.is_empty() {
+                // Esc clears, in priority: an active live filter, then a visual
+                // selection, then any pending key sequence / status message.
+                if self.live_filter.is_some() {
+                    self.live_filter = None;
+                    self.live_editing = false;
+                    self.refresh_rows(self.selected_path());
+                    self.status = Some("filter cleared".into());
+                } else if !self.selection.is_empty() {
                     self.selection.clear();
                     self.refresh_rows(self.selected_path());
+                    self.pending.clear();
+                } else {
+                    self.pending.clear();
+                    self.status = None;
                 }
-                self.pending.clear();
-                self.status = None;
             }
             Action::None => {}
         }
@@ -881,12 +889,14 @@ impl App {
     fn toggle_filter(&mut self, f: Filter) {
         let label = match f {
             Filter::Hidden => {
-                self.tree.show_hidden = !self.tree.show_hidden;
-                ("hidden files", self.tree.show_hidden)
-            }
-            Filter::Ignored => {
-                self.tree.show_ignored = !self.tree.show_ignored;
-                ("git-ignored", self.tree.show_ignored)
+                // One toggle for both dotfiles and git-ignored entries — keeping
+                // them tied means revealing hidden files also reveals ignored
+                // dirs (node_modules, dist), so navigating into them no longer
+                // makes them vanish.
+                let show = !self.tree.show_hidden;
+                self.tree.show_hidden = show;
+                self.tree.show_ignored = show;
+                ("hidden + ignored", show)
             }
             Filter::GitClean => {
                 self.git_clean = !self.git_clean;
@@ -1031,18 +1041,23 @@ impl App {
         let mut set = HashSet::new();
         let all = self.tree.all_paths();
         if query.is_empty() {
-            for (p, _) in all {
+            for (p, _, _) in all {
                 set.insert(p);
             }
             return set;
         }
+        // Mirror nvim-tree's `always_show_folders`: keep every directory visible
+        // so the tree stays navigable, and match only files by name. (The filter
+        // searches loaded nodes only — expand-all `E` first for a global filter.)
+        let always_show_folders = self.config.live_filter_show_folders;
         let pat = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
         let mut buf = Vec::new();
-        for (path, name) in all {
-            if pat
-                .score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
-                .is_some()
-            {
+        for (path, name, is_dir) in all {
+            let keep = (is_dir && always_show_folders)
+                || pat
+                    .score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
+                    .is_some();
+            if keep {
                 set.insert(path.clone());
                 let mut cur = path.as_path();
                 while let Some(parent) = cur.parent() {
@@ -1301,7 +1316,6 @@ enum PathKind {
 #[derive(Clone, Copy)]
 enum Filter {
     Hidden,
-    Ignored,
     GitClean,
     Custom,
     NoBuffer,
