@@ -103,7 +103,16 @@ pub fn scan(root: &Path) -> GitData {
             "status",
             "--porcelain=v1",
             "-z",
-            "--ignored",
+            // `matching` (not the default `traditional`) collapses a fully
+            // ignored directory into a single `dir/` entry instead of listing
+            // every file inside it. With `traditional` + `--untracked-files=all`
+            // git emits the *contents* of ignored dirs but not the dir itself,
+            // so an ignored folder (node_modules/, dist/) is only recognized as
+            // ignored once its children are loaded on expand — making it flash
+            // in and then vanish. `matching` tags the directory up front while
+            // still listing untracked files individually. (This mirrors
+            // nvim-tree.)
+            "--ignored=matching",
             "--untracked-files=all",
         ])
         .output();
@@ -187,6 +196,51 @@ mod tests {
             map.get(Path::new("/repo/new.rs")),
             Some(&GitStatus::Untracked)
         );
+    }
+
+    #[test]
+    fn ignored_directory_is_tagged_directly() {
+        // Regression: a fully git-ignored directory must be reported as a single
+        // `dir/` entry (so it's recognized as ignored without loading children),
+        // while untracked files are still listed individually. This depends on
+        // `--ignored=matching` in `scan()`.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("treelix-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("node_modules/foo")).unwrap();
+        std::fs::create_dir_all(dir.join("untracked_dir")).unwrap();
+        std::fs::write(dir.join(".gitignore"), b"node_modules/\n").unwrap();
+        std::fs::write(dir.join("node_modules/foo/index.js"), b"x").unwrap();
+        std::fs::write(dir.join("untracked_dir/new.txt"), b"y").unwrap();
+        std::fs::write(dir.join("tracked.txt"), b"z").unwrap();
+        // Canonicalize: on macOS /tmp is a symlink to /private/tmp, and git
+        // reports the canonical toplevel, so status keys use the real path.
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["add", ".gitignore", "tracked.txt"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+
+        let data = scan(&dir);
+        // The ignored directory itself is tagged (not just its children).
+        assert_eq!(
+            data.statuses.get(&dir.join("node_modules")),
+            Some(&GitStatus::Ignored),
+            "ignored dir should be tagged directly; got {:?}",
+            data.statuses
+        );
+        // Its contents are NOT listed individually (collapsed).
+        assert!(!data
+            .statuses
+            .contains_key(&dir.join("node_modules/foo/index.js")));
+        // Untracked files inside a non-ignored new dir are still per-file.
+        assert_eq!(
+            data.statuses.get(&dir.join("untracked_dir/new.txt")),
+            Some(&GitStatus::Untracked)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
