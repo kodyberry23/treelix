@@ -138,7 +138,9 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         theme.indent_marker,
     )));
 
-    let para = Paragraph::new(lines).style(theme.help);
+    let para = Paragraph::new(lines)
+        .style(theme.help)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
