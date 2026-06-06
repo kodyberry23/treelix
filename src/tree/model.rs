@@ -400,33 +400,35 @@ impl Tree {
     }
 }
 
-fn sort_refs(v: &mut [&Node], mode: SortMode, files_first: bool) {
+fn node_cmp(a: &Node, b: &Node, mode: SortMode, files_first: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    v.sort_by(|a, b| {
-        let ad = a.is_dir();
-        let bd = b.is_dir();
-        if ad != bd {
-            return if files_first {
-                if ad {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            } else if ad {
-                Ordering::Less
-            } else {
+    let ad = a.is_dir();
+    let bd = b.is_dir();
+    if ad != bd {
+        return if files_first {
+            if ad {
                 Ordering::Greater
-            };
-        }
-        let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
-        match mode {
-            SortMode::Name => by_name(),
-            SortMode::Modified => b.mtime.cmp(&a.mtime).then_with(by_name),
-            SortMode::Extension | SortMode::FileType => {
-                ext_of(&a.name).cmp(&ext_of(&b.name)).then_with(by_name)
+            } else {
+                Ordering::Less
             }
+        } else if ad {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+    match mode {
+        SortMode::Name => by_name(),
+        SortMode::Modified => b.mtime.cmp(&a.mtime).then_with(by_name),
+        SortMode::Extension | SortMode::FileType => {
+            ext_of(&a.name).cmp(&ext_of(&b.name)).then_with(by_name)
         }
-    });
+    }
+}
+
+fn sort_refs(v: &mut [&Node], mode: SortMode, files_first: bool) {
+    v.sort_by(|a, b| node_cmp(a, b, mode, files_first));
 }
 
 fn ext_of(name: &str) -> String {
@@ -468,10 +470,7 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
         node.mtime = meta.modified().ok();
         nodes.push(node);
     }
-    let mut refs: Vec<&Node> = nodes.iter().collect();
-    sort_refs(&mut refs, SortMode::Name, false);
-    let order: Vec<PathBuf> = refs.iter().map(|n| n.path.clone()).collect();
-    nodes.sort_by_key(|n| order.iter().position(|p| p == &n.path).unwrap_or(0));
+    nodes.sort_by(|a, b| node_cmp(a, b, SortMode::Name, false));
     nodes
 }
 
