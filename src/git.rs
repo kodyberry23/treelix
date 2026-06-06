@@ -2,8 +2,56 @@
 //! per-path status, mirroring nvim-tree's approach. Runs off the UI thread.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Upper bound on a single `git status` invocation. A pathological or enormous
+/// repository can make status slow; rather than block the git thread (and let
+/// invocations pile up) we kill it and treat the result as "no status this
+/// round". Mirrors nvim-tree's timeout-and-kill (it uses 400ms; we allow more
+/// headroom since we re-scan less often).
+const GIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Run a command capturing stdout, killing it if it exceeds `timeout`. Returns
+/// the captured stdout on a successful exit, or `None` on failure/timeout.
+fn run_capture(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Drain stdout on a separate thread so a large status output can't fill the
+    // pipe buffer and deadlock the child before it exits.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let buf = reader.join().unwrap_or_default();
+    success.then_some(buf)
+}
 
 /// A single effective git status category for a file (or the propagated
 /// highest-priority status for a directory). Ordered by nvim-tree's icon
@@ -96,9 +144,12 @@ pub fn scan(root: &Path) -> GitData {
         return GitData::default();
     };
 
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(&top)
+        // Don't take the optional index lock during a read-only status, so we
+        // never contend with a concurrent git command (matches nvim-tree).
+        .arg("--no-optional-locks")
         .args([
             "status",
             "--porcelain=v1",
@@ -114,14 +165,11 @@ pub fn scan(root: &Path) -> GitData {
             // nvim-tree.)
             "--ignored=matching",
             "--untracked-files=all",
-        ])
-        .output();
+        ]);
 
     let mut statuses = HashMap::new();
-    if let Ok(out) = out {
-        if out.status.success() {
-            parse_porcelain_z(&out.stdout, &top, &mut statuses);
-        }
+    if let Some(out) = run_capture(cmd, GIT_TIMEOUT) {
+        parse_porcelain_z(&out, &top, &mut statuses);
     }
 
     GitData {

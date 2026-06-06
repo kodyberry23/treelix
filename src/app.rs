@@ -40,7 +40,7 @@ pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Redraw,
-    Fs,
+    Fs(HashSet<PathBuf>),
     Git(GitData),
     Reveal(PathBuf),
 }
@@ -94,14 +94,14 @@ impl App {
 
         let (tx, rx) = unbounded();
 
-        // File watcher → Fs events.
-        let (fs_tx, fs_rx) = unbounded::<()>();
+        // File watcher → Fs events (carrying the set of changed paths).
+        let (fs_tx, fs_rx) = unbounded::<HashSet<PathBuf>>();
         let watcher = watcher::watch(root.clone(), fs_tx);
         {
             let tx = tx.clone();
             thread::spawn(move || {
-                while fs_rx.recv().is_ok() {
-                    if tx.send(AppEvent::Fs).is_err() {
+                while let Ok(paths) = fs_rx.recv() {
+                    if tx.send(AppEvent::Fs(paths)).is_err() {
                         break;
                     }
                 }
@@ -200,7 +200,7 @@ impl App {
             AppEvent::Key(k) => self.on_key(k),
             AppEvent::Mouse(m) => self.on_mouse(m),
             AppEvent::Redraw => {}
-            AppEvent::Fs => self.reload_from_disk(),
+            AppEvent::Fs(paths) => self.reload_from_paths(&paths),
             AppEvent::Git(data) => {
                 self.git = data;
                 self.tree.apply_git(&self.git);
@@ -972,6 +972,37 @@ impl App {
         self.tree.reload_preserving(&expanded);
         self.tree.apply_git(&self.git);
         self.refresh_rows(sel);
+        self.spawn_git();
+    }
+
+    /// Targeted reload for filesystem-watcher bursts: re-scan only the
+    /// directories whose contents actually changed, instead of re-reading every
+    /// expanded directory. This keeps churn cheap even when large trees are
+    /// expanded (mirrors nvim-tree's per-directory refresh). Git is always
+    /// re-scanned (off-thread, time-bounded) because a working-tree edit can
+    /// change status even inside a collapsed directory.
+    fn reload_from_paths(&mut self, changed: &HashSet<PathBuf>) {
+        let sel = self.selected_path();
+        // The directories whose listings may have changed are the parents of
+        // each touched path (plus the paths themselves, in case a watched dir's
+        // own entries changed).
+        let mut dirs: HashSet<PathBuf> = HashSet::new();
+        for p in changed {
+            if let Some(parent) = p.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+            dirs.insert(p.clone());
+        }
+        let mut touched = false;
+        for d in &dirs {
+            if self.tree.refresh_dir(d) {
+                touched = true;
+            }
+        }
+        if touched {
+            self.tree.apply_git(&self.git);
+            self.refresh_rows(sel);
+        }
         self.spawn_git();
     }
 

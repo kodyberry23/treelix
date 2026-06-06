@@ -239,6 +239,46 @@ impl Tree {
         }
     }
 
+    /// Re-scan a single loaded directory in place, preserving the expansion
+    /// state and cached subtrees of children that still exist. Returns true if
+    /// the directory was present and loaded (and thus refreshed).
+    ///
+    /// This is the targeted-reload primitive for filesystem-watcher events: only
+    /// the directory whose contents changed is re-read, instead of re-reading
+    /// every expanded directory (which is what a full rebuild does). Mirrors
+    /// nvim-tree's per-directory `reload`.
+    pub fn refresh_dir(&mut self, dir: &Path) -> bool {
+        let Some(node) = self.root.find_mut(dir) else {
+            return false;
+        };
+        if !node.is_dir() || !node.loaded {
+            return false;
+        }
+        let fresh = read_dir_sorted(&node.path);
+        // Index existing children so survivors keep their expansion/subtree.
+        let mut old: HashMap<PathBuf, Node> =
+            node.children.drain(..).map(|c| (c.path.clone(), c)).collect();
+        let mut merged = Vec::with_capacity(fresh.len());
+        for f in fresh {
+            match old.remove(&f.path) {
+                // Same path, still a directory: keep the existing node so its
+                // expansion state and loaded children survive; refresh metadata.
+                Some(mut existing) if existing.is_dir() && f.is_dir() => {
+                    existing.executable = f.executable;
+                    existing.mtime = f.mtime;
+                    existing.len = f.len;
+                    merged.push(existing);
+                }
+                // New entry, removed-and-recreated as a different kind, or a file
+                // whose size/mtime we want refreshed: take the fresh node.
+                _ => merged.push(f),
+            }
+        }
+        node.children = merged;
+        node.loaded = true;
+        true
+    }
+
     /// Expand all ancestors of `target` so it becomes visible.
     pub fn reveal(&mut self, target: &Path) -> bool {
         if !target.starts_with(&self.root.path) {
@@ -448,12 +488,15 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `file_type()` is cheap on macOS/Linux (uses the dirent d_type, no
-        // stat). `entry.metadata()` is an lstat (does not follow symlinks), so a
-        // single call covers size/mtime/permissions for the entry itself; only
-        // symlinks need an extra stat to learn whether the target is a dir.
-        let Ok(ft) = entry.file_type() else { continue };
+        // `DirEntry::metadata()` is a single `fstatat(AT_SYMLINK_NOFOLLOW)` (an
+        // lstat — it does NOT follow symlinks), so one syscall yields type, size,
+        // mtime and permission bits for the entry itself. We derive the kind from
+        // it rather than calling `file_type()` separately: that avoids the
+        // double-stat that `file_type()` would incur on filesystems returning
+        // `DT_UNKNOWN`. Only symlinks need an extra stat (to learn if the target
+        // is a directory). This is the std minimum: 1 stat/entry, 2 for symlinks.
         let Ok(meta) = entry.metadata() else { continue };
+        let ft = meta.file_type();
 
         let (kind, link_to) = if ft.is_symlink() {
             let target = fs::read_link(&path).ok();
@@ -562,6 +605,41 @@ mod tests {
         assert!(!tree.flatten(&opts).iter().any(|r| r.name == ".secret"));
         opts.show_hidden = true;
         assert!(tree.flatten(&opts).iter().any(|r| r.name == ".secret"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refresh_dir_merges_and_preserves_expansion() {
+        let d = tmpdir("refresh");
+        fs::create_dir_all(d.join("sub/inner")).unwrap();
+        fs::write(d.join("sub/inner/deep.txt"), b"x").unwrap();
+        fs::write(d.join("old.txt"), b"x").unwrap();
+        let mut tree = Tree::new(d.clone());
+        // Expand sub/inner so it has a loaded subtree to preserve.
+        tree.expand(&d.join("sub"));
+        tree.expand(&d.join("sub/inner"));
+        assert!(tree.collect_expanded().contains(&d.join("sub/inner")));
+
+        // Mutate the root dir on disk: add a new file, remove an old one.
+        fs::write(d.join("new.txt"), b"x").unwrap();
+        fs::remove_file(d.join("old.txt")).unwrap();
+
+        // Targeted refresh of the root only.
+        assert!(tree.refresh_dir(&d));
+
+        let rows = tree.flatten(&ViewOptions::default());
+        let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
+        assert!(names.iter().any(|n| *n == "new.txt"), "new file should appear");
+        assert!(!names.iter().any(|n| *n == "old.txt"), "removed file should be gone");
+        // The previously-expanded sub/inner subtree must survive the merge.
+        assert!(
+            tree.collect_expanded().contains(&d.join("sub/inner")),
+            "expansion state of untouched subtree should be preserved"
+        );
+        assert!(names.iter().any(|n| *n == "deep.txt"), "deep file still visible");
+
+        // Refreshing an unloaded/absent dir is a no-op returning false.
+        assert!(!tree.refresh_dir(&d.join("does-not-exist")));
         let _ = fs::remove_dir_all(&d);
     }
 
