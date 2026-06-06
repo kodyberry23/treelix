@@ -152,6 +152,9 @@ pub fn resolve(key: KeyEvent, pending: &str) -> (Action, String) {
 
         KeyCode::Char('R') => (Action::Refresh, none),
 
+        // Help: bare `?` (in addition to nvim-tree's `g?`).
+        KeyCode::Char('?') => (Action::Help, none),
+
         _ => (Action::None, none),
     }
 }
@@ -226,6 +229,11 @@ mod tests {
         assert_eq!(pending, "g");
         assert_eq!(resolve(key('y'), "g").0, Action::CopyAbspath);
         assert_eq!(resolve(key('?'), "g").0, Action::Help);
+    }
+
+    #[test]
+    fn bare_question_mark_opens_help() {
+        assert_eq!(resolve(key('?'), "").0, Action::Help);
     }
 
     #[test]

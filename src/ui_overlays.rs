@@ -169,7 +169,7 @@ pub const HELP_ENTRIES: &[(&str, &str)] = &[
     (". I C", "toggle hidden / ignored / git-clean"),
     ("U / B / M", "custom / no-buffer / no-bookmark"),
     ("R", "refresh"),
-    ("g?", "this help"),
+    ("? g?", "this help"),
     ("q", "quit"),
 ];
 

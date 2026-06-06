@@ -63,7 +63,7 @@ treelix [--root <dir>] [--theme <name>]   # run the sidebar TUI (root: cwd)
 treelix reveal <path>                      # reveal a path in a running instance
 ```
 
-Press `g?` inside treelix for the keybinding help panel.
+Press `?` (or `g?`) inside treelix for the keybinding help panel.
 
 ### Keybindings (nvim-tree defaults)
 
@@ -99,7 +99,7 @@ Press `g?` inside treelix for the keybinding help panel.
 | `.` / `I` / `C` | toggle hidden / git-ignored / git-clean |
 | `U` / `B` / `M` | toggle custom / no-buffer / no-bookmark filter |
 | `R` | refresh |
-| `g?` | help |
+| `?` / `g?` | help |
 | `q` | quit |
 
 Selection-aware ops: when nodes are multi-selected with `v`, the delete / trash /
