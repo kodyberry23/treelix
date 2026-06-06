@@ -34,6 +34,14 @@ use theme::Theme;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("--version") | Some("-V")
+    ) {
+        println!("treelix {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
     // `treelix reveal <path>` — client mode.
     if args.get(1).map(String::as_str) == Some("reveal") {
         let Some(path) = args.get(2) else {
@@ -127,6 +135,7 @@ fn print_help() {
          OPTIONS:\n  \
          --root <dir>    root directory (default: cwd)\n  \
          --theme <name>  theme name, or 'helix' to derive from Helix\n  \
+         -V, --version   print version\n  \
          -h, --help      show this help\n\n\
          Press g? inside treelix for keybindings."
     );
