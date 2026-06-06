@@ -19,15 +19,17 @@ env:
 
 jobs:
   build:
+    # Both targets build on the Apple-Silicon runner: aarch64 natively and
+    # x86_64 via cross-compilation. (GitHub removed the Intel macos-13 image;
+    # current Intel labels are macos-15-intel/-large, but cross-compiling from
+    # arm64 avoids needing a second runner entirely.)
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
