@@ -117,11 +117,26 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     // Paint the whole pane with the help background first.
     frame.render_widget(Block::default().style(theme.help), area);
 
+    // Inset the content: left/top padding so it isn't flush against the border,
+    // and reserve the bottom line for the "press any key" footer.
+    let pad_left = 2u16;
+    let inner_x = area.x + pad_left;
+    let inner_w = area.width.saturating_sub(pad_left + 1);
+    let body = Rect {
+        x: inner_x,
+        y: area.y + 1,
+        width: inner_w,
+        height: area.height.saturating_sub(3),
+    };
+    let footer = Rect {
+        x: inner_x,
+        y: area.y + area.height.saturating_sub(1),
+        width: inner_w,
+        height: 1,
+    };
+
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        " treelix — keybindings ",
-        theme.help_title,
-    )));
+    lines.push(Line::from(Span::styled("treelix — keybindings", theme.help_title)));
     lines.push(Line::from(""));
     for (key, desc) in HELP_ENTRIES {
         lines.push(Line::from(vec![
@@ -132,16 +147,18 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
             Span::styled(*desc, theme.text),
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "press any key to close",
-        theme.indent_marker,
-    )));
 
-    let para = Paragraph::new(lines)
+    let body_para = Paragraph::new(lines)
         .style(theme.help)
         .wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    frame.render_widget(body_para, body);
+
+    let footer_para = Paragraph::new(Line::from(Span::styled(
+        "press any key to close",
+        theme.indent_marker,
+    )))
+    .style(theme.help);
+    frame.render_widget(footer_para, footer);
 }
 
 pub const HELP_ENTRIES: &[(&str, &str)] = &[
