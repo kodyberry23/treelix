@@ -18,7 +18,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Create the GitHub release exactly once, before the parallel build jobs run.
+  # Previously each matrix job ran action-gh-release concurrently and, because a
+  # freshly-created release isn't immediately discoverable by tag, both jobs
+  # created their own release object for the same tag — leaving two releases
+  # each holding only half the assets. Gating the build jobs on this one makes
+  # the release already exist by the time they upload, so they attach to it
+  # instead of creating duplicates.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "tag=$tag cargo=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+
   build:
+    needs: create-release
     # Both targets build on the Apple-Silicon runner: aarch64 natively and
     # x86_64 via cross-compilation. (GitHub removed the Intel macos-13 image;
     # current Intel labels are macos-15-intel/-large, but cross-compiling from
@@ -31,17 +59,7 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check tag matches Cargo.toml version
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          ver="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-          echo "tag=$tag cargo=$ver"
-          if [ "$tag" != "$ver" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml version $ver"
-            exit 1
-          fi
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,11 +78,10 @@ jobs:
           tar -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
 
-      - name: Publish to release
-        uses: softprops/action-gh-release@v2
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             treelix-${{ matrix.target }}.tar.gz
             treelix-${{ matrix.target }}.tar.gz.sha256
-          generate_release_notes: true
           fail_on_unmatched_files: true
