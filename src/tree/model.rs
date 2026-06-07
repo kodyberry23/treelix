@@ -309,9 +309,10 @@ impl Tree {
                 if let Some(s) = walk(c, statuses) {
                     if s != GitStatus::Ignored {
                         best = Some(best.map_or(s, |b| b.max(s)));
-                    } else if best.is_none() {
-                        best = Some(s);
                     }
+                    // Never let a child's Ignored status change the parent's; a
+                    // directory is Ignored only if git reported its OWN path as
+                    // Ignored (captured in `best` from statuses.get(&n.path) above).
                 }
             }
             n.git = best;
@@ -592,6 +593,65 @@ mod tests {
         assert!(tree.flatten(&opts).iter().any(|r| r.name == "keep.txt"));
         opts.show_ignored = true;
         assert!(tree.flatten(&opts).iter().any(|r| r.name == "build"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ignored_child_does_not_hide_parent_after_expand() {
+        // Regression: a non-ignored directory whose ONLY git-status-bearing
+        // descendants are ignored leaf dirs (e.g. a package containing only
+        // committed-clean files plus node_modules/ and dist/) must NOT be
+        // marked or hidden as ignored. Only the leaf dirs that git reports as
+        // ignored by their OWN path stay hidden. This must hold even after the
+        // package's children are lazily loaded via expand (which is what made
+        // packages/ retroactively vanish before the fix).
+        let d = tmpdir("ignored-child");
+        fs::create_dir_all(d.join("packages/pkg-a/node_modules")).unwrap();
+        fs::create_dir_all(d.join("packages/pkg-a/dist")).unwrap();
+        fs::write(d.join("packages/pkg-a/node_modules/index.js"), b"x").unwrap();
+        fs::write(d.join("packages/pkg-a/dist/out.js"), b"x").unwrap();
+        fs::write(d.join("packages/pkg-a/package.json"), b"{}").unwrap();
+        // Canonicalize: on macOS /tmp is a symlink to /private/tmp.
+        let d = fs::canonicalize(&d).unwrap();
+
+        let mut tree = Tree::new(d.clone());
+        // Force the ignored grandchildren to be materialized as tree nodes,
+        // exactly as an interactive expand of pkg-a would.
+        tree.expand(&d.join("packages"));
+        tree.expand(&d.join("packages/pkg-a"));
+
+        // Git reports ONLY the leaf ignored dirs by their own path (this is
+        // what `--ignored=matching` produces); never packages/ or pkg-a/.
+        let mut statuses = HashMap::new();
+        statuses.insert(d.join("packages/pkg-a/node_modules"), GitStatus::Ignored);
+        statuses.insert(d.join("packages/pkg-a/dist"), GitStatus::Ignored);
+        let data = GitData {
+            toplevel: Some(d.clone()),
+            statuses,
+        };
+        tree.apply_git(&data);
+
+        // The non-ignored parents must keep git == None (not propagated Ignored).
+        let pkg_a_git = tree.root.find_mut(&d.join("packages/pkg-a")).unwrap().git;
+        assert_eq!(pkg_a_git, None, "pkg-a must not inherit child Ignored status");
+        let packages_git = tree.root.find_mut(&d.join("packages")).unwrap().git;
+        assert_eq!(packages_git, None, "packages/ must not inherit child Ignored status");
+        // The leaf dir git reported as ignored keeps its own status.
+        let nm_git = tree
+            .root
+            .find_mut(&d.join("packages/pkg-a/node_modules"))
+            .unwrap()
+            .git;
+        assert_eq!(nm_git, Some(GitStatus::Ignored));
+
+        // With show_ignored off: parents visible, ignored leaves hidden.
+        let opts = ViewOptions::default();
+        let rows = tree.flatten(&opts);
+        let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
+        assert!(names.iter().any(|n| *n == "packages"), "packages/ stays visible");
+        assert!(names.iter().any(|n| *n == "pkg-a"), "pkg-a stays visible");
+        assert!(!names.iter().any(|n| *n == "node_modules"), "node_modules hidden");
+        assert!(!names.iter().any(|n| *n == "dist"), "dist hidden");
         let _ = fs::remove_dir_all(&d);
     }
 
