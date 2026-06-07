@@ -31,7 +31,7 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check tag matches Cargo.toml version
         run: |
@@ -61,7 +61,7 @@ jobs:
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
 
       - name: Publish to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             treelix-${{ matrix.target }}.tar.gz
