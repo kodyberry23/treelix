@@ -138,19 +138,36 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled("treelix — keybindings", theme.help_title)));
     lines.push(Line::from(""));
+
+    // Two-column layout: a fixed-width key column on the left and descriptions
+    // on the right that wrap *within their own column* instead of spilling back
+    // under the keybinding. We pre-wrap each description to the right column's
+    // width and print the key only on the first row (blank cell on the rest),
+    // so we don't rely on paragraph wrapping (which would reset to column 0).
+    let key_col = HELP_ENTRIES
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8)
+        + 1; // one-space gutter between the columns
+    let desc_w = (body.width as usize).saturating_sub(key_col).max(1);
+
     for (key, desc) in HELP_ENTRIES {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{key:<8}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(*desc, theme.text),
-        ]));
+        for (i, seg) in wrap_words(desc, desc_w).into_iter().enumerate() {
+            let key_cell = if i == 0 {
+                format!("{key:<key_col$}")
+            } else {
+                " ".repeat(key_col)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(key_cell, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(seg, theme.text),
+            ]));
+        }
     }
 
-    let body_para = Paragraph::new(lines)
-        .style(theme.help)
-        .wrap(Wrap { trim: false });
+    // Descriptions are already wrapped to fit, so render without paragraph wrap.
+    let body_para = Paragraph::new(lines).style(theme.help);
     frame.render_widget(body_para, body);
 
     let footer_para = Paragraph::new(Line::from(Span::styled(
@@ -159,6 +176,35 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     )))
     .style(theme.help);
     frame.render_widget(footer_para, footer);
+}
+
+/// Greedy word-wrap `text` into segments no wider than `width` columns. A word
+/// longer than `width` is placed on its own line (it may overflow), which is
+/// fine for the short help descriptions. Always returns at least one segment.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 pub const HELP_ENTRIES: &[(&str, &str)] = &[
@@ -225,4 +271,38 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_words_keeps_segments_within_width() {
+        let segs = wrap_words("live filter (files; E first for all) / clear", 12);
+        assert!(segs.len() > 1, "long desc should wrap to multiple rows");
+        for s in &segs {
+            assert!(s.chars().count() <= 12, "segment {s:?} exceeds width");
+        }
+        // No information is lost: joining segments reproduces the words.
+        assert_eq!(
+            segs.join(" ").split_whitespace().collect::<Vec<_>>(),
+            "live filter (files; E first for all) / clear"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrap_words_short_desc_is_single_segment() {
+        assert_eq!(wrap_words("down / up", 40), vec!["down / up".to_string()]);
+    }
+
+    #[test]
+    fn wrap_words_long_word_gets_its_own_line() {
+        // A single token wider than the column is placed alone rather than dropped.
+        let segs = wrap_words("supercalifragilistic word", 8);
+        assert_eq!(segs[0], "supercalifragilistic");
+        assert_eq!(segs[1], "word");
+    }
 }
