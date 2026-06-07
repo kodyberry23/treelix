@@ -12,6 +12,9 @@ use super::{decorators, icons};
 pub struct RenderOpts {
     pub icons_enabled: bool,
     pub show_arrows: bool,
+    /// Draw tree connector lines (│ ├ └). When false, use plain indentation
+    /// with a chevron on directories (nvim-tree style).
+    pub indent_markers: bool,
 }
 
 /// Build one `ListItem` per visible row.
@@ -29,29 +32,38 @@ pub fn build_items<'a>(
 fn build_line<'a>(row: &Row, theme: &Theme, opts: &RenderOpts, decor: &Decor) -> Line<'a> {
     let mut spans: Vec<Span<'a>> = Vec::new();
 
-    // Indent markers. The last entry of `ancestor_last` is this node's own
-    // connector; earlier entries are vertical guides for its ancestors.
-    let prefix = indent_prefix(&row.ancestor_last);
-    if !prefix.is_empty() {
-        spans.push(Span::styled(prefix, theme.indent_marker));
-    }
-
     let is_dir = row.kind.is_dir();
+    let expandable = is_dir && row.has_children;
 
-    // Optional expand/collapse arrow for directories.
-    if opts.show_arrows && is_dir && row.has_children {
-        let arrow = if opts.icons_enabled {
-            if row.expanded {
-                icons::ARROW_OPEN
-            } else {
-                icons::ARROW_CLOSED
-            }
-        } else if row.expanded {
-            icons::ascii::ARROW_OPEN
+    if opts.indent_markers {
+        // Connector-line indentation. The last entry of `ancestor_last` is this
+        // node's own connector; earlier entries are vertical guides for its
+        // ancestors. An optional chevron is then drawn before the icon.
+        let prefix = indent_prefix(&row.ancestor_last);
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, theme.indent_marker));
+        }
+        if opts.show_arrows && expandable {
+            spans.push(Span::styled(
+                format!("{} ", arrow_glyph(row, opts.icons_enabled)),
+                theme.arrow,
+            ));
+        }
+    } else {
+        // nvim-tree style: plain whitespace indentation for ancestor levels,
+        // then a chevron in this node's own cell (or blank padding so names stay
+        // aligned with their chevroned siblings). No connector lines.
+        if row.depth > 0 {
+            spans.push(Span::raw("  ".repeat(row.depth)));
+        }
+        if opts.show_arrows && expandable {
+            spans.push(Span::styled(
+                format!("{} ", arrow_glyph(row, opts.icons_enabled)),
+                theme.arrow,
+            ));
         } else {
-            icons::ascii::ARROW_CLOSED
-        };
-        spans.push(Span::styled(format!("{arrow} "), theme.arrow));
+            spans.push(Span::raw("  "));
+        }
     }
 
     // Icon.
@@ -95,6 +107,21 @@ fn build_line<'a>(row: &Row, theme: &Theme, opts: &RenderOpts, decor: &Decor) ->
     }
 
     Line::from(spans)
+}
+
+/// The expand/collapse chevron glyph for a directory row.
+fn arrow_glyph(row: &Row, icons_enabled: bool) -> &'static str {
+    if icons_enabled {
+        if row.expanded {
+            icons::ARROW_OPEN
+        } else {
+            icons::ARROW_CLOSED
+        }
+    } else if row.expanded {
+        icons::ascii::ARROW_OPEN
+    } else {
+        icons::ascii::ARROW_CLOSED
+    }
 }
 
 fn indent_prefix(ancestor_last: &[bool]) -> String {
@@ -192,7 +219,8 @@ mod tests {
         let theme = Theme::default();
         let opts = RenderOpts {
             icons_enabled: false,
-            show_arrows: false,
+            show_arrows: true,
+            indent_markers: false,
         };
         let clipboard = Clipboard::default();
         let marks = HashSet::new();
@@ -221,5 +249,74 @@ mod tests {
             .collect();
         assert!(text.contains("src"), "buffer was: {text:?}");
         assert!(text.contains("README.md"), "buffer was: {text:?}");
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn nvim_tree_style_uses_chevrons_not_connector_lines() {
+        let theme = Theme::default();
+        let opts = RenderOpts {
+            icons_enabled: false,
+            show_arrows: true,
+            indent_markers: false,
+        };
+        let clipboard = Clipboard::default();
+        let marks = HashSet::new();
+        let selection = HashSet::new();
+        let decor = Decor {
+            clipboard: &clipboard,
+            marks: &marks,
+            selection: &selection,
+            current_file: None,
+            special_files: &[],
+        };
+
+        // Top-level expanded dir + a nested file one level deeper.
+        let mut dir = row("lua", NodeKind::Directory, vec![false]);
+        dir.expanded = true;
+        dir.has_children = true;
+        let file = row("init.lua", NodeKind::File, vec![false, true]);
+
+        let dir_line = line_text(&build_line(&dir, &theme, &opts, &decor));
+        let file_line = line_text(&build_line(&file, &theme, &opts, &decor));
+
+        // The directory leads with its chevron; no connector glyphs anywhere.
+        assert!(dir_line.starts_with("v "), "dir line: {dir_line:?}");
+        for g in ["│", "├", "└"] {
+            assert!(
+                !dir_line.contains(g) && !file_line.contains(g),
+                "connector {g:?} found in {dir_line:?} / {file_line:?}"
+            );
+        }
+        // Nested file: 2 spaces of ancestor indent + a 2-space (blank chevron)
+        // own cell, keeping it aligned under its siblings.
+        assert!(file_line.starts_with("    "), "file line: {file_line:?}");
+        assert!(file_line.contains("init.lua"));
+    }
+
+    #[test]
+    fn indent_markers_mode_still_draws_connector_lines() {
+        let theme = Theme::default();
+        let opts = RenderOpts {
+            icons_enabled: false,
+            show_arrows: true,
+            indent_markers: true,
+        };
+        let clipboard = Clipboard::default();
+        let marks = HashSet::new();
+        let selection = HashSet::new();
+        let decor = Decor {
+            clipboard: &clipboard,
+            marks: &marks,
+            selection: &selection,
+            current_file: None,
+            special_files: &[],
+        };
+        let file = row("init.lua", NodeKind::File, vec![false, true]);
+        let line = line_text(&build_line(&file, &theme, &opts, &decor));
+        assert!(line.contains('│') || line.contains('└'), "line: {line:?}");
     }
 }

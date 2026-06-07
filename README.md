@@ -15,8 +15,9 @@ It was built to replace [broot](https://dystroy.org/broot/) as the file sidebar.
 
 ## Features
 
-- **Tree view** with Nerd Font icons, indent guides, dirs-first sorting, lazy
-  loading, and a `~`-shortened root header.
+- **Tree view** with Nerd Font icons, nvim-tree-style chevron indentation
+  (optional connector lines), dirs-first sorting, lazy loading, and a
+  `~`-shortened root header.
 - **Git status** (per-file glyphs + colors, propagated to folders) via the
   `git` CLI — staged `✓`, dirty `✗`, untracked `★`, renamed `➜`, deleted,
   conflict, ignored `◌`.
@@ -121,7 +122,9 @@ Optional `~/.config/treelix/config.toml`:
 ```toml
 theme = "nord-aurora"   # a treelix theme name, or "helix" to derive from Helix
 icons = true            # Nerd Font glyphs (false → ASCII fallbacks)
-arrows = false          # show expand/collapse arrows before folder icons
+arrows = true           # expand/collapse chevrons (▸/▾) on directories
+indent_markers = false  # true → tree connector lines (│ ├ └); false → plain
+                        #   indentation with chevrons, nvim-tree style
 show_hidden = false     # initial state of dotfiles (`.` toggles this + ignored)
 show_ignored = false    # initial state of git-ignored entries
 sort = "name"           # name | modified | extension | filetype

@@ -12,8 +12,12 @@ pub struct Config {
     pub theme: String,
     /// Whether to render Nerd Font glyphs (set false for ASCII fallbacks).
     pub icons: bool,
-    /// Render expand/collapse arrows before folder icons.
+    /// Render expand/collapse chevrons (▸/▾) on directories, nvim-tree style.
     pub arrows: bool,
+    /// Draw tree connector lines (│ ├ └) for indentation. When false (default),
+    /// indentation is plain whitespace with a chevron on each directory, exactly
+    /// like nvim-tree with `renderer.indent_markers.enable = false`.
+    pub indent_markers: bool,
     /// Show dotfiles by default.
     pub show_hidden: bool,
     /// Show git-ignored files by default.
@@ -47,7 +51,8 @@ impl Default for Config {
         Config {
             theme: "nord-aurora".to_string(),
             icons: true,
-            arrows: false,
+            arrows: true,
+            indent_markers: false,
             show_hidden: false,
             show_ignored: false,
             sort: "name".to_string(),

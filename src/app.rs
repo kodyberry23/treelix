@@ -1268,6 +1268,7 @@ impl App {
             let opts = RenderOpts {
                 icons_enabled: self.config.icons,
                 show_arrows: self.config.arrows,
+                indent_markers: self.config.indent_markers,
             };
             let decor = Decor {
                 clipboard: &self.clipboard,
