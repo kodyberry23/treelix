@@ -10,7 +10,8 @@ use std::time::SystemTime;
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -348,11 +349,11 @@ impl App {
                 self.refresh_rows(self.selected_path());
             }
             Action::SearchNode => {
-                self.overlay = Overlay::Input(InputState {
-                    prompt: " search ".into(),
-                    buffer: String::new(),
-                    kind: InputKind::Search,
-                });
+                self.overlay = Overlay::Input(InputState::new(
+                    " search ",
+                    String::new(),
+                    InputKind::Search,
+                ));
             }
             Action::Refresh => {
                 self.reload_from_disk();
@@ -394,10 +395,24 @@ impl App {
                 self.overlay = Overlay::None;
                 self.submit_input(state);
             }
-            KeyCode::Backspace => {
-                state.buffer.pop();
-            }
-            KeyCode::Char(c) => state.buffer.push(c),
+            KeyCode::Backspace => state.backspace(),
+            KeyCode::Delete => state.delete(),
+            KeyCode::Left => state.left(),
+            KeyCode::Right => state.right(),
+            KeyCode::Home => state.home(),
+            KeyCode::End => state.end(),
+            // Emacs-style line editing for terminal muscle memory.
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => state.left(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => state.right(),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => state.home(),
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => state.end(),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => state.delete(),
+            // Ignore other control/alt chords so they don't land in the buffer.
+            KeyCode::Char(_)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
+            KeyCode::Char(c) => state.insert(c),
             _ => {}
         }
     }
@@ -613,11 +628,11 @@ impl App {
 
     fn start_create(&mut self) {
         let dir = self.current_dir_context();
-        self.overlay = Overlay::Input(InputState {
-            prompt: format!(" create in {}/ ", shorten(&dir)),
-            buffer: String::new(),
-            kind: InputKind::Create { dir },
-        });
+        self.overlay = Overlay::Input(InputState::new(
+            format!(" create in {}/ ", shorten(&dir)),
+            String::new(),
+            InputKind::Create { dir },
+        ));
     }
 
     fn start_rename(&mut self, kind: RenameKind) {
@@ -679,11 +694,7 @@ impl App {
                 )
             }
         };
-        self.overlay = Overlay::Input(InputState {
-            prompt: prompt.into(),
-            buffer,
-            kind: ikind,
-        });
+        self.overlay = Overlay::Input(InputState::new(prompt, buffer, ikind));
     }
 
     fn start_confirm_delete(&mut self, trash: bool) {

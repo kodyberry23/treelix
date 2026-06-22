@@ -31,6 +31,66 @@ pub struct InputState {
     pub prompt: String,
     pub buffer: String,
     pub kind: InputKind,
+    /// Byte offset of the insertion point within `buffer` (always on a char boundary).
+    pub cursor: usize,
+}
+
+impl InputState {
+    /// Create an input prompt with the cursor positioned at the end of `buffer`.
+    pub fn new(prompt: impl Into<String>, buffer: String, kind: InputKind) -> Self {
+        let cursor = buffer.len();
+        Self {
+            prompt: prompt.into(),
+            buffer,
+            kind,
+            cursor,
+        }
+    }
+
+    /// Insert a character at the cursor and advance past it.
+    pub fn insert(&mut self, c: char) {
+        self.buffer.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the cursor (Backspace).
+    pub fn backspace(&mut self) {
+        if let Some(c) = self.buffer[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+            self.buffer.remove(self.cursor);
+        }
+    }
+
+    /// Delete the character at the cursor (Delete).
+    pub fn delete(&mut self) {
+        if self.cursor < self.buffer.len() {
+            self.buffer.remove(self.cursor);
+        }
+    }
+
+    /// Move the cursor one character left.
+    pub fn left(&mut self) {
+        if let Some(c) = self.buffer[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    /// Move the cursor one character right.
+    pub fn right(&mut self) {
+        if let Some(c) = self.buffer[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    /// Move the cursor to the start of the buffer.
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the cursor to the end of the buffer.
+    pub fn end(&mut self) {
+        self.cursor = self.buffer.len();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,9 +129,11 @@ pub fn render_input(frame: &mut Frame, area: Rect, theme: &Theme, state: &InputS
         .borders(Borders::ALL)
         .border_style(theme.prompt)
         .title(Span::styled(state.prompt.clone(), theme.prompt));
+    let (before, after) = state.buffer.split_at(state.cursor);
     let line = Line::from(vec![
-        Span::styled(&state.buffer, theme.text),
+        Span::styled(before, theme.text),
         Span::styled("▏", theme.prompt), // cursor
+        Span::styled(after, theme.text),
     ]);
     let para = Paragraph::new(line).block(block);
     frame.render_widget(para, popup);
