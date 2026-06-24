@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -132,7 +132,7 @@ pub fn render_input(frame: &mut Frame, area: Rect, theme: &Theme, state: &InputS
     let (before, after) = state.buffer.split_at(state.cursor);
     let line = Line::from(vec![
         Span::styled(before, theme.text),
-        Span::styled("▏", theme.prompt), // cursor
+        Span::styled("▏", Style::default().fg(Color::White)), // cursor
         Span::styled(after, theme.text),
     ]);
     let para = Paragraph::new(line).block(block);
