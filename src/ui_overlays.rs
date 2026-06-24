@@ -95,8 +95,9 @@ impl InputState {
 
 #[derive(Debug, Clone)]
 pub enum InputKind {
-    /// Create relative to this directory (trailing `/` in buffer = directory).
-    Create { dir: PathBuf },
+    /// Create at a path resolved against the tree root (the buffer is prefilled
+    /// with the editable base directory; trailing `/` = directory).
+    Create,
     /// Rename the full basename of this path.
     Rename { path: PathBuf },
     /// Rename only the stem, keeping the extension.

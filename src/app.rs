@@ -447,10 +447,21 @@ impl App {
             _ => {}
         }
         match state.kind {
-            InputKind::Create { dir } => {
+            InputKind::Create => {
                 let is_dir = value.ends_with('/');
                 let clean = value.trim_end_matches('/');
-                let target = dir.join(clean);
+                // A bare directory prefix (e.g. "src/") with no name is a no-op.
+                if clean.is_empty() {
+                    return;
+                }
+                // Resolve relative to the tree root (absolute paths honored),
+                // mirroring RenameFull, so editing the prefix down to nothing
+                // creates at the root. ops::create makes intermediate dirs.
+                let target = if Path::new(clean).is_absolute() {
+                    PathBuf::from(clean)
+                } else {
+                    self.tree.root.path.join(clean)
+                };
                 match crate::tree::ops::create(&target, is_dir) {
                     Ok(()) => {
                         self.reload_from_disk();
@@ -628,10 +639,23 @@ impl App {
 
     fn start_create(&mut self) {
         let dir = self.current_dir_context();
+        // Prefill the editable buffer with the base directory (relative to the
+        // tree root, trailing slash), nvim-tree style. The path is editable, so
+        // it can be retargeted to any directory - including the project root
+        // (clear the prefix) even when the cursor sits on a nested node. An
+        // empty prefix means "create at the root". The trailing-slash dir rule
+        // and intermediate-dir creation are handled on submit / in ops::create.
+        let prefill = dir
+            .strip_prefix(&self.tree.root.path)
+            .ok()
+            .map(|rel| rel.to_string_lossy())
+            .filter(|rel| !rel.is_empty())
+            .map(|rel| format!("{rel}/"))
+            .unwrap_or_default();
         self.overlay = Overlay::Input(InputState::new(
-            format!(" create in {}/ ", shorten(&dir)),
-            String::new(),
-            InputKind::Create { dir },
+            format!(" create in {}/ ", shorten(&self.tree.root.path)),
+            prefill,
+            InputKind::Create,
         ));
     }
 
