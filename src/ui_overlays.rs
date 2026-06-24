@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -129,12 +129,22 @@ pub fn render_input(frame: &mut Frame, area: Rect, theme: &Theme, state: &InputS
         .borders(Borders::ALL)
         .border_style(theme.prompt)
         .title(Span::styled(state.prompt.clone(), theme.prompt));
-    let (before, after) = state.buffer.split_at(state.cursor);
-    let line = Line::from(vec![
-        Span::styled(before, theme.text),
-        Span::styled("▏", Style::default().fg(Color::White)), // cursor
-        Span::styled(after, theme.text),
-    ]);
+    // Block cursor: draw the character at the insertion point as a reverse-
+    // video block in the prompt's accent (orange in nord-aurora), matching the
+    // input field. At end-of-input there's no character there, so render a
+    // trailing space as the block.
+    let cursor_style = theme.prompt.add_modifier(Modifier::REVERSED);
+    let (before, rest) = state.buffer.split_at(state.cursor);
+    let mut spans = vec![Span::styled(before, theme.text)];
+    match rest.chars().next() {
+        Some(c) => {
+            let len = c.len_utf8();
+            spans.push(Span::styled(&rest[..len], cursor_style));
+            spans.push(Span::styled(&rest[len..], theme.text));
+        }
+        None => spans.push(Span::styled(" ", cursor_style)),
+    }
+    let line = Line::from(spans);
     let para = Paragraph::new(line).block(block);
     frame.render_widget(para, popup);
 }
