@@ -137,17 +137,153 @@ pub fn render_input(frame: &mut Frame, area: Rect, theme: &Theme, state: &InputS
     let cursor_style = theme.prompt.add_modifier(Modifier::REVERSED);
     let (before, rest) = state.buffer.split_at(state.cursor);
     let mut spans = vec![Span::styled(before, theme.text)];
+    // Display width of the cursor block itself (1 for the trailing-space
+    // block at end-of-input, 2 for a wide char under the cursor).
+    let cursor_cell;
     match rest.chars().next() {
         Some(c) => {
             let len = c.len_utf8();
-            spans.push(Span::styled(&rest[..len], cursor_style));
+            let span = Span::styled(&rest[..len], cursor_style);
+            cursor_cell = span.width().max(1);
+            spans.push(span);
             spans.push(Span::styled(&rest[len..], theme.text));
         }
-        None => spans.push(Span::styled(" ", cursor_style)),
+        None => {
+            cursor_cell = 1;
+            spans.push(Span::styled(" ", cursor_style));
+        }
+    }
+    // Horizontal scroll: keep the cursor block in view. Paragraph clips at
+    // the right border, so without this a name longer than the (narrow
+    // sidebar) popup pushes the insertion point off-screen and you type
+    // blind. Scroll just enough that the cursor sits at the right edge.
+    //
+    // The offset must land on a character-cell boundary: asked to start
+    // mid-way through a double-width char, ratatui's truncator renders the
+    // whole char instead, shifting the line right one cell and clipping the
+    // cursor block off the border again. Round up to the next boundary.
+    let inner_width = popup.width.saturating_sub(2) as usize; // borders
+    let cursor_col = Span::raw(before).width();
+    let desired = (cursor_col + cursor_cell).saturating_sub(inner_width);
+    let mut scroll = 0usize;
+    for c in before.chars() {
+        if scroll >= desired {
+            break;
+        }
+        let mut buf = [0u8; 4];
+        scroll += Span::raw(&*c.encode_utf8(&mut buf)).width();
     }
     let line = Line::from(spans);
-    let para = Paragraph::new(line).block(block);
+    let para = Paragraph::new(line)
+        .block(block)
+        .scroll((0, u16::try_from(scroll).unwrap_or(u16::MAX)));
     frame.render_widget(para, popup);
+}
+
+#[cfg(test)]
+mod input_scroll_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render an input prompt into a width x 3 frame; return the popup's
+    /// content row text and whether the reverse-video cursor block is visible.
+    fn render_row(width: u16, state: &InputState) -> (String, bool) {
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        terminal
+            .draw(|f| render_input(f, f.area(), &theme, state))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row: String = (0..width)
+            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
+            .collect();
+        let cursor_visible = (0..width).any(|x| {
+            buf.cell((x, 1))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        });
+        (row, cursor_visible)
+    }
+
+    #[test]
+    fn short_input_renders_from_start() {
+        let state = InputState::new("New file", "notes.md".into(), InputKind::Create);
+        let (row, cursor_visible) = render_row(20, &state);
+        assert!(row.contains("notes.md"), "row was: {row:?}");
+        assert!(cursor_visible);
+    }
+
+    #[test]
+    fn long_input_scrolls_to_keep_cursor_visible() {
+        // 29 chars in a popup with 18 inner columns: without horizontal
+        // scroll the tail (and the end-of-input cursor) would be clipped at
+        // the right border and typing would be invisible.
+        let state = InputState::new(
+            "New file",
+            "src/deeply/nested/longname.rs".into(),
+            InputKind::Create,
+        );
+        let (row, cursor_visible) = render_row(20, &state);
+        assert!(
+            row.contains("longname.rs"),
+            "tail near the cursor must be visible, row was: {row:?}"
+        );
+        assert!(
+            !row.contains("src/"),
+            "start should have scrolled out of view, row was: {row:?}"
+        );
+        assert!(cursor_visible);
+    }
+
+    #[test]
+    fn cursor_moved_to_start_scrolls_back_to_show_beginning() {
+        let mut state = InputState::new(
+            "Rename",
+            "src/deeply/nested/longname.rs".into(),
+            InputKind::Rename {
+                path: PathBuf::from("x"),
+            },
+        );
+        state.cursor = 0;
+        let (row, _) = render_row(20, &state);
+        assert!(
+            row.contains("src/deeply"),
+            "with the cursor at the start the beginning must be visible, row was: {row:?}"
+        );
+    }
+
+    #[test]
+    fn ascii_cursor_visible_at_every_width_and_length() {
+        for width in 5..=24u16 {
+            for n in 1..=40usize {
+                let text: String = "abcdefghij".chars().cycle().take(n).collect();
+                let state = InputState::new("New", text, InputKind::Create);
+                let (row, cursor_visible) = render_row(width, &state);
+                assert!(cursor_visible, "cursor clipped: width={width} n={n} row={row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wide_char_cursor_visible_at_every_width_and_length() {
+        // Double-width chars exercise the boundary-alignment path: an
+        // unaligned scroll offset makes ratatui shift the line one cell
+        // right and clip the cursor block.
+        for width in 6..=24u16 {
+            for n in 1..=14usize {
+                let text: String = "日本語のファイル名です前".chars().cycle().take(n).collect();
+                let state = InputState::new("New", text.clone(), InputKind::Create);
+                let (row, cursor_visible) = render_row(width, &state);
+                assert!(
+                    cursor_visible,
+                    "cursor clipped: width={width} n={n} buffer={text:?} row={row:?}"
+                );
+            }
+        }
+    }
 }
 
 /// Render a yes/no confirmation popup.
