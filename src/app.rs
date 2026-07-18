@@ -1573,3 +1573,147 @@ fn human_ago(t: SystemTime) -> String {
         Err(_) => "in the future".into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unique_tmpdir() -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir()
+            .join(format!("treelix-apptest-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// App rooted at a fresh temp tree:
+    ///   root/
+    ///     sub/deep.txt   (sub collapsed at startup -> deep.txt not in `rows`)
+    ///     a.txt
+    /// Tree::new does not canonicalize, so paths derived from the same root
+    /// match its nodes (no macOS /private mismatch). Returns (app, root, deep).
+    fn app_with_tree() -> (App, PathBuf, PathBuf) {
+        let root = unique_tmpdir();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/deep.txt"), b"x").unwrap();
+        fs::write(root.join("a.txt"), b"x").unwrap();
+        let app = App::new(root.clone(), Config::default(), Theme::default());
+        let deep = root.join("sub").join("deep.txt");
+        (app, root, deep)
+    }
+
+    /// Is `deep` an actual visible row (i.e. `sub` is expanded)?
+    fn deep_visible(app: &App, deep: &Path) -> bool {
+        app.rows.iter().any(|r| r.path == *deep)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // Regression guard for f9744e4: set_status/clear_status must assign the
+    // field, not call themselves. If the recursion returns, this test blows the
+    // stack and aborts instead of asserting cleanly.
+    #[test]
+    fn set_and_clear_status_do_not_recurse() {
+        let (mut app, _root, _deep) = app_with_tree();
+        app.set_status("hello");
+        assert_eq!(app.status.as_deref(), Some("hello"));
+        assert!(app.status_deadline.is_some(), "deadline should be armed");
+        app.clear_status();
+        assert_eq!(app.status, None);
+        assert!(app.status_deadline.is_none(), "deadline should be disarmed");
+    }
+
+    #[test]
+    fn explicit_reveal_applies_immediately() {
+        let (mut app, _root, deep) = app_with_tree();
+        assert!(!deep_visible(&app, &deep), "sub collapsed at startup");
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: deep.clone(),
+            follow: false,
+        }));
+        assert_eq!(app.current_file.as_ref(), Some(&deep));
+        assert!(app.pending_reveal.is_none(), "explicit reveal is never deferred");
+        assert!(deep_visible(&app, &deep), "sub expanded, deep revealed");
+        assert_eq!(app.selected_path().as_ref(), Some(&deep));
+    }
+
+    #[test]
+    fn follow_reveal_is_deferred_while_driving() {
+        let (mut app, _root, deep) = app_with_tree();
+        app.touch(); // user just acted -> within the grace window
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: deep.clone(),
+            follow: true,
+        }));
+        // Highlight updates immediately...
+        assert_eq!(app.current_file.as_ref(), Some(&deep));
+        // ...but the expand + cursor move is held back.
+        assert_eq!(app.pending_reveal.as_ref(), Some(&deep));
+        assert!(!deep_visible(&app, &deep), "deferred: sub stays collapsed");
+    }
+
+    #[test]
+    fn follow_reveal_applies_when_idle() {
+        let (mut app, _root, deep) = app_with_tree();
+        app.last_input = None; // not driving the tree
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: deep.clone(),
+            follow: true,
+        }));
+        assert!(app.pending_reveal.is_none());
+        assert!(deep_visible(&app, &deep), "idle follow reveals immediately");
+    }
+
+    #[test]
+    fn deferred_reveal_applies_on_next_event_once_idle() {
+        let (mut app, _root, deep) = app_with_tree();
+        app.touch();
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: deep.clone(),
+            follow: true,
+        }));
+        assert_eq!(app.pending_reveal.as_ref(), Some(&deep), "deferred");
+        assert!(!deep_visible(&app, &deep));
+
+        // User goes idle; the next event (any kind) flushes the pending reveal
+        // before it is handled.
+        app.last_input = None;
+        app.handle_event(AppEvent::Redraw);
+        assert!(app.pending_reveal.is_none(), "pending reveal consumed");
+        assert!(deep_visible(&app, &deep), "tree synced to Helix's buffer");
+    }
+
+    #[test]
+    fn acting_key_arms_grace_but_inert_key_does_not() {
+        let (mut app, _root, _deep) = app_with_tree();
+        app.last_input = None;
+        app.on_key(key(KeyCode::Char('j'))); // resolves to Down -> acts
+        assert!(app.last_input.is_some(), "a mapped key must arm the grace window");
+
+        let (mut app2, _r2, _d2) = app_with_tree();
+        app2.last_input = None;
+        app2.on_key(key(KeyCode::F(9))); // unmapped, no pending chord -> inert
+        assert!(
+            app2.last_input.is_none(),
+            "an unmapped key must not arm the grace window"
+        );
+    }
+
+    #[test]
+    fn chord_prefix_arms_grace() {
+        // A dead prefix (`g`) resolves to no action but a pending chord; it is
+        // the user driving the tree, so it must arm the window.
+        let (mut app, _root, _deep) = app_with_tree();
+        app.last_input = None;
+        app.on_key(key(KeyCode::Char('g')));
+        assert!(!app.pending.is_empty(), "g starts a multi-key sequence");
+        assert!(app.last_input.is_some(), "a chord prefix arms the grace window");
+    }
+}
