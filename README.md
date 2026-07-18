@@ -27,8 +27,15 @@ It was built to replace [broot](https://dystroy.org/broot/) as the file sidebar.
   paste, and copy-path-to-clipboard.
 - **Open in Helix**: `<CR>` opens the file in the running Helix over its Unix
   socket (helix-editor/helix PR #13896), with vsplit/hsplit and system-open.
-- **Reveal**: a tiny IPC socket lets Helix tell treelix to reveal the current
-  buffer (`treelix reveal <path>`), replacing broot's `--listen`/`--send`.
+- **Reveal / follow**: a tiny IPC socket lets Helix tell treelix to reveal the
+  current buffer (`treelix reveal <path>`), replacing broot's
+  `--listen`/`--send`. With the helix-files integration, the patched Helix
+  pushes `reveal-follow <path>` on every focused-buffer change, so the tree
+  follows the editor (nvim-tree's `update_focused_file`). Follow-reveals are
+  deferred while you're actively driving treelix (last acted-on input <1s
+  ago): the current-file highlight updates immediately, and the expand +
+  cursor move is applied once you've been idle past the window. Explicit
+  reveals (plain `reveal`) always apply immediately.
 - **Theming**: treelix owns its theme via its own theme file and ships a
   built-in Deep Nord Aurora theme. It can also derive colors from your active
   Helix theme (`theme = "helix"`).
@@ -148,12 +155,22 @@ A treelix theme is a TOML file (`~/.config/treelix/themes/<name>.toml`) with a
 ## Opening files in Helix
 
 By default treelix routes `<CR>` to the dotfiles dispatcher
-`~/projects/helix-files/scripts/dispatch-to-editor.sh` (which sends `:open`/
-`:vsplit` to Helix over its per-session socket and focuses the editor pane,
-falling back to spawning a fresh `hx` pane). If that script isn't present,
-treelix performs the same dispatch itself, resolving the socket from
-`HELIX_SOCKET_PATH` / `$XDG_RUNTIME_DIR/helix/<session>.sock`. Override with
-`open_command` or the `TREELIX_DISPATCH_TO_EDITOR` env var.
+`~/projects/helix-files/scripts/dispatch-to-editor.sh` (which sends the
+window-picker commands `:open-pick`/`:vsplit-pick` to Helix over its per-session
+socket and focuses the editor pane, falling back to spawning a fresh `hx` pane).
+If that script isn't present, treelix performs the same dispatch itself
+(`:open-pick`/`:vsplit-pick`/`:hsplit-pick` under zellij, plain `:open`/`:vsplit`/
+`:hsplit` otherwise), resolving the socket from `HELIX_SOCKET_PATH` /
+`$XDG_RUNTIME_DIR/helix/<session>.sock`. Override with `open_command` (whose
+`{mode}` is `open`/`vsplit`/`hsplit`) or the `TREELIX_DISPATCH_TO_EDITOR` env var.
+
+**Window picker:** the `*-pick` commands require a Helix built with the
+`local-patches` window-picker patch. If the file is already visible in a split,
+Helix jumps to that split (no picker, no reopen). Otherwise: with one split the
+command acts immediately (`<CR>` opens in it; `Ctrl-V`/`Ctrl-X` create the second
+window); with two or more, Helix centers an uppercase letter in each split's
+statusline and the next keypress (either case) opens the file **in** the chosen
+split — the picker selects an existing window, it never creates a new one.
 
 ## Roadmap
 

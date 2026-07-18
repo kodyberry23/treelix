@@ -43,7 +43,7 @@ pub enum AppEvent {
     Redraw,
     Fs(HashSet<PathBuf>),
     Git(GitData),
-    Reveal(PathBuf),
+    Reveal(ipc::Reveal),
 }
 
 pub struct App {
@@ -81,6 +81,15 @@ pub struct App {
     // Helix-aware state
     current_file: Option<PathBuf>,
     opened: HashSet<PathBuf>,
+    /// Last input that ACTED on the tree, used to defer follow-reveals
+    /// (see AppEvent::Reveal). Inert input (unmapped keys, stray clicks,
+    /// pointer motion) does not count.
+    last_input: Option<Instant>,
+    /// A follow-reveal that arrived while the user was driving the tree;
+    /// applied by handle_event once the grace window has passed. Helix
+    /// pushes each path only once, so a deferred reveal must be kept, not
+    /// dropped.
+    pending_reveal: Option<PathBuf>,
 
     matcher: Matcher,
 
@@ -115,7 +124,7 @@ impl App {
         }
 
         // Reveal IPC socket → Reveal events.
-        let (rev_tx, rev_rx) = unbounded::<PathBuf>();
+        let (rev_tx, rev_rx) = unbounded::<ipc::Reveal>();
         let socket = ipc::serve(rev_tx);
         {
             let tx = tx.clone();
@@ -154,6 +163,8 @@ impl App {
             live_editing: false,
             current_file: None,
             opened: HashSet::new(),
+            last_input: None,
+            pending_reveal: None,
             matcher: Matcher::new(NucleoConfig::DEFAULT),
             config,
             tx,
@@ -230,7 +241,20 @@ impl App {
     }
 
     fn handle_event(&mut self, ev: AppEvent) {
+        // Apply a deferred follow-reveal once the user has been idle past
+        // the grace window — before the event below is processed, so a
+        // returning keypress lands on a tree already synced to Helix's
+        // current buffer.
+        if self.pending_reveal.is_some() && !self.recent_input() {
+            if let Some(path) = self.pending_reveal.take() {
+                self.reveal(&path);
+            }
+        }
         match ev {
+            // Input bumps `last_input` inside on_key/on_mouse, and only when
+            // it actually acts on the tree: unmapped keys, stray clicks, and
+            // passive pointer motion (reported by any-event mouse tracking)
+            // must not gate follow-reveals.
             AppEvent::Key(k) => self.on_key(k),
             AppEvent::Mouse(m) => self.on_mouse(m),
             AppEvent::Redraw => {}
@@ -240,26 +264,65 @@ impl App {
                 self.tree.apply_git(&self.git);
                 self.refresh_rows(self.selected_path());
             }
-            AppEvent::Reveal(path) => {
-                // Helix told us its current buffer: mark it, reveal, highlight.
+            AppEvent::Reveal(ipc::Reveal { path, follow }) => {
+                // Helix told us its current buffer: mark it and highlight
+                // (the highlight is styling derived from `current_file`, so
+                // the regular post-event redraw picks it up — no row rebuild
+                // needed here).
                 self.current_file = Some(path.clone());
                 self.opened.insert(path.clone());
-                self.reveal(&path);
+                // Explicit reveals (A-r / space-f / `treelix reveal`) always
+                // act. Automatic follow pushes may arrive as echoes of what
+                // this pane just did (Enter-open, Tab-preview) — while the
+                // user is driving the tree, defer instead of yanking their
+                // cursor and expansion state; handle_event applies the
+                // deferred path once they've been idle past the grace window.
+                if follow && self.recent_input() {
+                    self.pending_reveal = Some(path);
+                } else {
+                    self.pending_reveal = None;
+                    self.reveal(&path);
+                }
             }
         }
+    }
+
+    /// True while the user is actively driving treelix (last acted-on input
+    /// within the grace window). Follow-reveals are deferred during this
+    /// window; explicit reveals ignore it.
+    fn recent_input(&self) -> bool {
+        const FOLLOW_INPUT_GRACE: Duration = Duration::from_millis(1000);
+        self.last_input
+            .is_some_and(|t| t.elapsed() < FOLLOW_INPUT_GRACE)
+    }
+
+    /// Record that the user just acted on the tree (gates follow-reveals).
+    fn touch(&mut self) {
+        self.last_input = Some(Instant::now());
     }
 
     // ── Input ───────────────────────────────────────────────────────────────
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Overlay/live-filter keystrokes and keys that resolve to an action
+        // (or extend a chord) all count as driving the tree; a key that does
+        // nothing (unmapped, dead prefix) must not gate follow-reveals.
         match &self.overlay {
-            Overlay::Input(_) => return self.on_input_key(key),
-            Overlay::Confirm(_) => return self.on_confirm_key(key),
+            Overlay::Input(_) => {
+                self.touch();
+                return self.on_input_key(key);
+            }
+            Overlay::Confirm(_) => {
+                self.touch();
+                return self.on_confirm_key(key);
+            }
             Overlay::Info(_) => {
+                self.touch();
                 self.overlay = Overlay::None;
                 return;
             }
             Overlay::Help => {
+                self.touch();
                 self.overlay = Overlay::None;
                 return;
             }
@@ -268,10 +331,14 @@ impl App {
 
         // Live-filter editing captures input.
         if self.live_editing {
+            self.touch();
             return self.on_live_key(key);
         }
 
         let (action, pending) = keymap::resolve(key, &self.pending);
+        if action != Action::None || !pending.is_empty() {
+            self.touch();
+        }
         self.pending = pending;
         if action != Action::None {
             self.dispatch(action);
@@ -1291,15 +1358,25 @@ impl App {
         if !self.config.mouse {
             return;
         }
+        // touch() only where the event actually acts on the tree: passive
+        // pointer motion, drags, other buttons, and clicks that land outside
+        // the list must not gate follow-reveals.
         match m.kind {
-            MouseEventKind::ScrollDown => self.move_selection(1),
-            MouseEventKind::ScrollUp => self.move_selection(-1),
+            MouseEventKind::ScrollDown => {
+                self.touch();
+                self.move_selection(1);
+            }
+            MouseEventKind::ScrollUp => {
+                self.touch();
+                self.move_selection(-1);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = self.list_area;
                 if m.row >= area.y && m.row < area.y + area.height && !self.rows.is_empty() {
                     let offset = self.list_state.offset();
                     let idx = offset + (m.row - area.y) as usize;
                     if idx < self.rows.len() {
+                        self.touch();
                         self.list_state.select(Some(idx));
                         self.open_or_toggle();
                     }

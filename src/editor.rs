@@ -1,10 +1,12 @@
 //! Routing a selected file into the running Helix instance.
 //!
-//! Primary path: reuse the dotfiles' `dispatch-to-editor.sh`, which sends
-//! `:open`/`:vsplit <path>` to Helix over its per-session Unix socket
-//! (helix-editor/helix PR #13896) and focuses the editor pane, with a fallback
-//! that spawns a fresh `hx` pane. If that script isn't present, treelix does the
-//! same dispatch itself.
+//! Primary path: reuse the dotfiles' `dispatch-to-editor.sh` (mode arg
+//! open|vsplit|hsplit), which sends the window-picker commands
+//! `:open-pick`/`:vsplit-pick`/`:hsplit-pick <path>` to Helix over its
+//! per-session Unix socket (helix-editor/helix PR #13896) and focuses the editor
+//! pane, with a fallback that spawns a fresh `hx` pane. If that script isn't
+//! present (or rejects the mode), treelix does the same dispatch itself
+//! (`*-pick` under zellij, plain `:open`/`:vsplit`/`:hsplit` otherwise).
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -22,18 +24,34 @@ pub enum OpenMode {
 
 impl OpenMode {
     fn helix_cmd(self) -> &'static str {
+        // The `-pick` variants (helix local-patch) prompt with per-split labels
+        // when multiple splits exist, and fall back to the plain action when
+        // there is only one. Used by the internal socket path under zellij,
+        // where we can focus the editor pane so the labels are reachable; the
+        // dotfiles dispatch script sends the same commands for open/vsplit.
+        match self {
+            OpenMode::Open => ":open-pick",
+            OpenMode::VSplit => ":vsplit-pick",
+            OpenMode::HSplit => ":hsplit-pick",
+        }
+    }
+    fn helix_cmd_plain(self) -> &'static str {
+        // Non-picker variants, used when there is no zellij to move focus to
+        // the editor pane — a picker would be armed but unreachable.
         match self {
             OpenMode::Open => ":open",
             OpenMode::VSplit => ":vsplit",
             OpenMode::HSplit => ":hsplit",
         }
     }
-    fn dispatch_arg(self) -> &'static str {
+    /// Faithful mode name: the `{mode}` value for user `open_command` templates
+    /// and the mode argument passed to the dotfiles dispatch script (which
+    /// accepts open|vsplit|hsplit).
+    fn name(self) -> &'static str {
         match self {
             OpenMode::Open => "open",
             OpenMode::VSplit => "vsplit",
-            // The dispatch script only knows open/vsplit; hsplit goes internal.
-            OpenMode::HSplit => "open",
+            OpenMode::HSplit => "hsplit",
         }
     }
 }
@@ -45,22 +63,19 @@ pub fn open(path: &Path, mode: OpenMode, config: &Config) {
     // 1. Explicit user template: `open_command` with {mode}/{path}.
     if let Some(tmpl) = &config.open_command {
         let cmd = tmpl
-            .replace("{mode}", mode.dispatch_arg())
+            .replace("{mode}", mode.name())
             .replace("{path}", &abs.to_string_lossy());
         let _ = Command::new("sh").arg("-c").arg(cmd).status();
         return;
     }
 
-    // 2. dotfiles dispatcher (open/vsplit only).
-    if !matches!(mode, OpenMode::HSplit) {
-        if let Some(script) = dispatch_script() {
-            let status = Command::new(&script)
-                .arg(mode.dispatch_arg())
-                .arg(&abs)
-                .status();
-            if matches!(status, Ok(s) if s.success()) {
-                return;
-            }
+    // 2. dotfiles dispatcher. An older script that predates hsplit support
+    // rejects it with a non-zero exit, in which case we fall through to the
+    // internal socket dispatch below — graceful under version skew.
+    if let Some(script) = dispatch_script() {
+        let status = Command::new(&script).arg(mode.name()).arg(&abs).status();
+        if matches!(status, Ok(s) if s.success()) {
+            return;
         }
     }
 
@@ -78,14 +93,23 @@ pub fn system_open(path: &Path) {
 pub fn preview(path: &Path) {
     let abs = absolutize(path);
     if let Some(sock) = helix_socket_path().filter(|s| is_socket(s)) {
-        let _ = send_to_socket(&sock, &format!(":open {}", abs.display()));
+        // Quote so paths with spaces parse as one argument on the helix side.
+        let _ = send_to_socket(&sock, &format!(":open {}", helix_quote(&abs)));
     }
 }
 
 fn internal_dispatch(abs: &Path, mode: OpenMode) {
     let sock = helix_socket_path();
     if let Some(sock) = sock.filter(|s| is_socket(s)) {
-        let line = format!("{} {}", mode.helix_cmd(), abs.display());
+        // Use the picker variants only under zellij (where focus_editor_pane can
+        // bring the labels into view); otherwise send the plain command. Quote
+        // the path so filenames with spaces parse as a single argument.
+        let cmd = if std::env::var_os("ZELLIJ").is_some() {
+            mode.helix_cmd()
+        } else {
+            mode.helix_cmd_plain()
+        };
+        let line = format!("{} {}", cmd, helix_quote(abs));
         if send_to_socket(&sock, &line).is_ok() {
             focus_editor_pane();
             return;
@@ -109,6 +133,14 @@ fn internal_dispatch(abs: &Path, mode: OpenMode) {
     } else {
         let _ = Command::new("hx").arg(abs).status();
     }
+}
+
+/// Single-quote a path for helix's command line, escaping embedded single
+/// quotes by doubling them. Single quotes keep the path LITERAL — unlike double
+/// quotes, which route the token through helix's `%`/`%sh{}` expansion (breaking
+/// filenames with `%` and risking `%sh{...}` execution from a crafted filename).
+fn helix_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', "''"))
 }
 
 fn send_to_socket(sock: &Path, line: &str) -> std::io::Result<()> {
@@ -236,5 +268,24 @@ mod tests {
     fn sanitize_session() {
         assert_eq!(sanitize("my project!"), "my_project_");
         assert_eq!(sanitize("ok-name_1"), "ok-name_1");
+    }
+
+    #[test]
+    fn helix_quote_escapes_for_command_line() {
+        // Plain path: wrapped in single quotes, unchanged inside.
+        assert_eq!(helix_quote(Path::new("/a/b.txt")), "'/a/b.txt'");
+        // Spaces stay inside the single quotes (one argument on the helix side).
+        assert_eq!(helix_quote(Path::new("/a b/c d.txt")), "'/a b/c d.txt'");
+        // `%` must stay literal — single quotes prevent helix's %/%sh{} expansion.
+        assert_eq!(helix_quote(Path::new("/x/50%.txt")), "'/x/50%.txt'");
+        assert_eq!(
+            helix_quote(Path::new("/x/%sh{touch X}.txt")),
+            "'/x/%sh{touch X}.txt'"
+        );
+        // Embedded single quote is doubled (helix single-quote escaping).
+        assert_eq!(helix_quote(Path::new("/x/it's.txt")), "'/x/it''s.txt'");
+        assert_eq!(helix_quote(Path::new("/x/a''b.txt")), "'/x/a''''b.txt'");
+        // A double quote inside a single-quoted token is literal, no escaping.
+        assert_eq!(helix_quote(Path::new("/x/a\"b.txt")), "'/x/a\"b.txt'");
     }
 }

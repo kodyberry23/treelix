@@ -83,6 +83,9 @@ pub fn resolve(key: KeyEvent, pending: &str) -> (Action, String) {
     // Ctrl-chord bindings.
     if ctrl {
         let action = match key.code {
+            // Ctrl-V / Ctrl-X: with a single window, create a new vertical/
+            // horizontal split; with two or more windows, show the picker and
+            // open the file in the window you choose (replace it — no new split).
             KeyCode::Char('v') => Action::VSplit,
             KeyCode::Char('x') => Action::HSplit,
             KeyCode::Char(']') => Action::CdInto,
@@ -217,6 +220,7 @@ mod tests {
         assert_eq!(resolve(key('j'), "").0, Action::Down);
         assert_eq!(resolve(key('a'), "").0, Action::Create);
         assert_eq!(resolve(ctrl('v'), "").0, Action::VSplit);
+        assert_eq!(resolve(ctrl('x'), "").0, Action::HSplit);
         assert_eq!(resolve(key('.'), "").0, Action::ToggleHidden);
         assert_eq!(resolve(key('f'), "").0, Action::LiveFilterStart);
     }

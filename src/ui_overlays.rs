@@ -429,7 +429,7 @@ pub const HELP_ENTRIES: &[(&str, &str)] = &[
     ("L", "toggle group-empty dirs"),
     ("]c [c", "next / prev git change"),
     ("<Tab>", "preview in Helix (no focus)"),
-    ("C-v C-x", "open in vsplit / hsplit"),
+    ("C-v C-x", "vsplit / hsplit — pick window if ≥2 open"),
     ("s", "system open"),
     ("a", "create (trailing / = dir)"),
     ("d <Del>", "delete (confirm)"),
