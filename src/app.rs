@@ -5,10 +5,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -60,6 +60,11 @@ pub struct App {
     pending: String,
     git: GitData,
     status: Option<String>,
+    // When the transient status message should disappear on its own. Set
+    // alongside `status` by set_status(); the event loop wakes at this
+    // instant to clear it so a message never lingers while the user is off
+    // in the editor and never touches the sidebar again.
+    status_deadline: Option<Instant>,
     should_quit: bool,
 
     // View state
@@ -136,6 +141,7 @@ impl App {
             pending: String::new(),
             git: GitData::default(),
             status: None,
+            status_deadline: None,
             should_quit: false,
             sort: SortMode::parse(&config.sort),
             files_first: config.files_first,
@@ -159,6 +165,22 @@ impl App {
         app.list_state.select(Some(0));
         app.spawn_git();
         app
+    }
+
+    /// How long a transient status message stays on screen before the
+    /// event loop clears it on its own.
+    const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
+
+    /// Show a transient status message and arm its auto-clear deadline.
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.set_status(msg.into());
+        self.status_deadline = Some(Instant::now() + Self::STATUS_TIMEOUT);
+    }
+
+    /// Clear the status message and disarm its deadline.
+    fn clear_status(&mut self) {
+        self.clear_status();
+        self.status_deadline = None;
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
@@ -185,9 +207,20 @@ impl App {
 
         loop {
             self.draw(terminal)?;
-            match self.rx.recv() {
+            // With a status message showing, wait only until its deadline so
+            // we can clear it even if no further event ever arrives; a passed
+            // deadline yields a zero wait -> immediate Timeout -> clear.
+            // Otherwise block until the next event.
+            let received = match self.status_deadline {
+                Some(deadline) => self
+                    .rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match received {
                 Ok(ev) => self.handle_event(ev),
-                Err(_) => break,
+                Err(RecvTimeoutError::Timeout) => self.clear_status(),
+                Err(RecvTimeoutError::Disconnected) => break,
             }
             if self.should_quit {
                 break;
@@ -272,7 +305,7 @@ impl App {
     }
 
     fn dispatch(&mut self, action: Action) {
-        self.status = None;
+        self.clear_status();
         match action {
             Action::Quit => self.should_quit = true,
             Action::Down => self.move_selection(1),
@@ -357,7 +390,7 @@ impl App {
             }
             Action::Refresh => {
                 self.reload_from_disk();
-                self.status = Some("refreshed".into());
+                self.set_status("refreshed");
             }
             Action::Help => self.overlay = Overlay::Help,
             Action::ToggleSelect => self.toggle_select(),
@@ -368,14 +401,14 @@ impl App {
                     self.live_filter = None;
                     self.live_editing = false;
                     self.refresh_rows(self.selected_path());
-                    self.status = Some("filter cleared".into());
+                    self.set_status("filter cleared");
                 } else if !self.selection.is_empty() {
                     self.selection.clear();
                     self.refresh_rows(self.selected_path());
                     self.pending.clear();
                 } else {
                     self.pending.clear();
-                    self.status = None;
+                    self.clear_status();
                 }
             }
             Action::None => {}
@@ -466,9 +499,9 @@ impl App {
                     Ok(()) => {
                         self.reload_from_disk();
                         self.reveal(&target);
-                        self.status = Some(format!("created {clean}"));
+                        self.set_status(format!("created {clean}"));
                     }
-                    Err(e) => self.status = Some(format!("create failed: {e}")),
+                    Err(e) => self.set_status(format!("create failed: {e}")),
                 }
             }
             InputKind::Rename { path } => self.do_rename(&path, &value),
@@ -492,9 +525,9 @@ impl App {
                     Ok(()) => {
                         self.reload_from_disk();
                         self.reveal(&target);
-                        self.status = Some(format!("moved to {value}"));
+                        self.set_status(format!("moved to {value}"));
                     }
-                    Err(e) => self.status = Some(format!("rename failed: {e}")),
+                    Err(e) => self.set_status(format!("rename failed: {e}")),
                 }
             }
             InputKind::Search => {}
@@ -508,9 +541,9 @@ impl App {
             Ok(()) => {
                 self.reload_from_disk();
                 self.reveal(&target);
-                self.status = Some(format!("renamed to {new_name}"));
+                self.set_status(format!("renamed to {new_name}"));
             }
-            Err(e) => self.status = Some(format!("rename failed: {e}")),
+            Err(e) => self.set_status(format!("rename failed: {e}")),
         }
     }
 
@@ -540,9 +573,9 @@ impl App {
         match result {
             Ok(n) => {
                 self.reload_from_disk();
-                self.status = Some(format!("removed {n} item(s)"));
+                self.set_status(format!("removed {n} item(s)"));
             }
-            Err(e) => self.status = Some(format!("remove failed: {e}")),
+            Err(e) => self.set_status(format!("remove failed: {e}")),
         }
     }
 
@@ -754,7 +787,7 @@ impl App {
         }
         let n = targets.len();
         self.clipboard.set(op, targets);
-        self.status = Some(format!(
+        self.set_status(format!(
             "{} {n} item(s)",
             if op == ClipOp::Cut { "cut" } else { "copied" }
         ));
@@ -763,7 +796,7 @@ impl App {
 
     fn paste(&mut self) {
         if self.clipboard.is_empty() {
-            self.status = Some("clipboard empty".into());
+            self.set_status("clipboard empty");
             return;
         }
         let dest = self.current_dir_context();
@@ -778,7 +811,7 @@ impl App {
             };
             match res {
                 Ok(()) => last = Some(target),
-                Err(e) => self.status = Some(format!("paste failed: {e}")),
+                Err(e) => self.set_status(format!("paste failed: {e}")),
             }
         }
         if op == Some(ClipOp::Cut) {
@@ -805,7 +838,7 @@ impl App {
             PathKind::Absolute => row.path.to_string_lossy().into_owned(),
         };
         copy_to_clipboard(&text);
-        self.status = Some(format!("yanked: {text}"));
+        self.set_status(format!("yanked: {text}"));
     }
 
     fn file_info(&mut self) {
@@ -851,7 +884,7 @@ impl App {
     fn toggle_mark(&mut self) {
         if let Some(row) = self.current_row().cloned() {
             let now = self.marks.toggle(&row.path);
-            self.status = Some(format!(
+            self.set_status(format!(
                 "{} bookmark: {}",
                 if now { "added" } else { "removed" },
                 row.name
@@ -885,7 +918,7 @@ impl App {
     fn bulk_remove(&mut self, trash: bool) {
         let paths: Vec<PathBuf> = self.marks.all().iter().cloned().collect();
         if paths.is_empty() {
-            self.status = Some("no bookmarks".into());
+            self.set_status("no bookmarks");
             return;
         }
         let verb = if trash { "trash" } else { "delete" };
@@ -903,7 +936,7 @@ impl App {
     fn bulk_move(&mut self) {
         let paths: Vec<PathBuf> = self.marks.all().iter().cloned().collect();
         if paths.is_empty() {
-            self.status = Some("no bookmarks".into());
+            self.set_status("no bookmarks");
             return;
         }
         let dest = self.current_dir_context();
@@ -916,7 +949,7 @@ impl App {
         }
         self.marks.remove_all(&paths);
         self.reload_from_disk();
-        self.status = Some(format!("moved {moved} bookmarked item(s)"));
+        self.set_status(format!("moved {moved} bookmarked item(s)"));
     }
 
     // ── Filters ───────────────────────────────────────────────────────────────
@@ -950,7 +983,7 @@ impl App {
                 ("bookmarked only", self.no_bookmark)
             }
         };
-        self.status = Some(format!(
+        self.set_status(format!(
             "{}: {}",
             label.0,
             if label.1 { "on" } else { "off" }
@@ -968,7 +1001,7 @@ impl App {
             }
             self.tree.apply_git(&self.git);
         }
-        self.status = Some(format!(
+        self.set_status(format!(
             "group empty dirs: {}",
             if self.group_empty { "on" } else { "off" }
         ));
@@ -988,7 +1021,7 @@ impl App {
                 return;
             }
         }
-        self.status = Some(format!("no match: {query}"));
+        self.set_status(format!("no match: {query}"));
     }
 
     // ── Reveal / reload ─────────────────────────────────────────────────────
@@ -1249,7 +1282,7 @@ impl App {
                 return;
             }
         }
-        self.status = Some("no git changes".into());
+        self.set_status("no git changes");
     }
 
     // ── Mouse ─────────────────────────────────────────────────────────────────
