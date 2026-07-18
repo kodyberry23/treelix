@@ -173,13 +173,13 @@ impl App {
 
     /// Show a transient status message and arm its auto-clear deadline.
     fn set_status(&mut self, msg: impl Into<String>) {
-        self.set_status(msg.into());
+        self.status = Some(msg.into());
         self.status_deadline = Some(Instant::now() + Self::STATUS_TIMEOUT);
     }
 
     /// Clear the status message and disarm its deadline.
     fn clear_status(&mut self) {
-        self.clear_status();
+        self.status = None;
         self.status_deadline = None;
     }
 
