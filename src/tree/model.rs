@@ -114,6 +114,9 @@ impl Tree {
     pub fn load_children(&mut self, path: &Path) {
         if let Some(node) = self.root.find_mut(path) {
             if node.is_dir() && !node.loaded {
+                // Stat BEFORE reading: a change racing the read then looks
+                // stale on the next expand instead of being missed.
+                node.loaded_mtime = dir_mtime(&node.path);
                 node.children = read_dir_sorted(&node.path);
                 node.loaded = true;
             }
@@ -154,9 +157,38 @@ impl Tree {
     }
 
     fn do_expand(&mut self, path: &Path) {
-        let needs_load = matches!(self.root.find_mut(path), Some(n) if n.is_dir() && !n.loaded);
-        if needs_load {
-            self.load_children(path);
+        // Loaded directories are re-synced with disk on expand when stale (the
+        // merge in refresh_dir preserves child expansion state and cached
+        // subtrees). Trusting the cache unconditionally would make any
+        // filesystem-watcher gap permanent: a change missed while the
+        // directory sat collapsed would never surface, because nothing else
+        // re-reads a loaded dir. Staleness is decided by comparing the dir's
+        // current mtime against the one observed at load — one stat, so the
+        // common unchanged case stays O(1) instead of a full re-read per
+        // toggle (which stalls on huge or network directories).
+        enum State {
+            Unloaded,
+            Fresh,
+            Stale,
+        }
+        let state = match self.root.find_mut(path) {
+            Some(n) if n.is_dir() => {
+                if !n.loaded {
+                    Some(State::Unloaded)
+                } else if n.loaded_mtime.is_some() && dir_mtime(&n.path) == n.loaded_mtime {
+                    Some(State::Fresh)
+                } else {
+                    Some(State::Stale)
+                }
+            }
+            _ => None,
+        };
+        match state {
+            Some(State::Unloaded) => self.load_children(path),
+            Some(State::Stale) => {
+                self.refresh_dir(path);
+            }
+            Some(State::Fresh) | None => {}
         }
         if let Some(node) = self.root.find_mut(path) {
             if node.is_dir() {
@@ -239,6 +271,20 @@ impl Tree {
         }
     }
 
+    /// Collapse everything, then expand exactly the directories in `expanded`
+    /// (shallowest first, skipping ones that no longer exist). Used to put the
+    /// tree back the way it was after a live filter auto-expanded to matches.
+    pub fn restore_expanded(&mut self, expanded: &HashSet<PathBuf>) {
+        self.collapse_all();
+        let mut paths: Vec<&PathBuf> = expanded.iter().collect();
+        paths.sort_by_key(|p| p.components().count());
+        for p in paths {
+            if p.exists() {
+                self.do_expand(p);
+            }
+        }
+    }
+
     /// Re-scan a single loaded directory in place, preserving the expansion
     /// state and cached subtrees of children that still exist. Returns true if
     /// the directory was present and loaded (and thus refreshed).
@@ -254,7 +300,14 @@ impl Tree {
         if !node.is_dir() || !node.loaded {
             return false;
         }
-        let fresh = read_dir_sorted(&node.path);
+        // A vanished or unreadable directory must not wipe the cached listing
+        // to "empty" — keep what we had; the parent's own refresh prunes the
+        // node once the deletion event lands.
+        let mtime = dir_mtime(&node.path);
+        let Some(fresh) = try_read_dir_sorted(&node.path) else {
+            return false;
+        };
+        node.loaded_mtime = mtime;
         // Index existing children so survivors keep their expansion/subtree.
         let mut old: HashMap<PathBuf, Node> =
             node.children.drain(..).map(|c| (c.path.clone(), c)).collect();
@@ -427,20 +480,6 @@ impl Tree {
         true
     }
 
-    /// All paths in the loaded tree, for live-filter matching. Each entry is
-    /// `(path, name, is_dir)`; `is_dir` lets the filter keep folders visible
-    /// (nvim-tree's `always_show_folders`) while matching only files by name.
-    pub fn all_paths(&self) -> Vec<(PathBuf, String, bool)> {
-        let mut out = Vec::new();
-        fn walk(n: &Node, out: &mut Vec<(PathBuf, String, bool)>) {
-            for c in &n.children {
-                out.push((c.path.clone(), c.name.clone(), c.is_dir()));
-                walk(c, out);
-            }
-        }
-        walk(&self.root, &mut out);
-        out
-    }
 }
 
 fn node_cmp(a: &Node, b: &Node, mode: SortMode, files_first: bool) -> std::cmp::Ordering {
@@ -481,12 +520,20 @@ fn ext_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The directory's own mtime, used as the staleness signal for cached listings.
+fn dir_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(dir).and_then(|m| m.modified()).ok()
+}
+
 /// Read a directory and return children as nodes (dirs first, name-sorted).
 pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
+    try_read_dir_sorted(dir).unwrap_or_default()
+}
+
+/// Like [`read_dir_sorted`], but distinguishes "empty" from "unreadable".
+fn try_read_dir_sorted(dir: &Path) -> Option<Vec<Node>> {
     let mut nodes = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return nodes;
-    };
+    let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
         // `DirEntry::metadata()` is a single `fstatat(AT_SYMLINK_NOFOLLOW)` (an
@@ -516,7 +563,7 @@ pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
         nodes.push(node);
     }
     nodes.sort_by(|a, b| node_cmp(a, b, SortMode::Name, false));
-    nodes
+    Some(nodes)
 }
 
 #[cfg(unix)]
@@ -700,6 +747,59 @@ mod tests {
 
         // Refreshing an unloaded/absent dir is a no-op returning false.
         assert!(!tree.refresh_dir(&d.join("does-not-exist")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn expand_rereads_loaded_dir_from_disk() {
+        // Regression: a directory's children were read once (loaded=true) and
+        // never again on expand, so any change the filesystem watcher missed
+        // (event overflow, ignored-component filtering, races) stayed invisible
+        // forever — "the dir shows up but not the files in it". Expand must
+        // re-sync with disk while preserving child expansion state.
+        let d = tmpdir("expand-reread");
+        fs::create_dir_all(d.join("sub/inner")).unwrap();
+        fs::write(d.join("sub/old.txt"), b"x").unwrap();
+        let mut tree = Tree::new(d.clone());
+        tree.expand(&d.join("sub"));
+        tree.expand(&d.join("sub/inner"));
+        tree.collapse(&d.join("sub"));
+
+        // Mutate sub/ on disk with NO watcher notification.
+        fs::write(d.join("sub/new.txt"), b"y").unwrap();
+        fs::remove_file(d.join("sub/old.txt")).unwrap();
+
+        tree.expand(&d.join("sub"));
+        let rows = tree.flatten(&ViewOptions::default());
+        let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
+        assert!(names.iter().any(|n| *n == "new.txt"), "missed file appears on expand");
+        assert!(!names.iter().any(|n| *n == "old.txt"), "missed deletion applied on expand");
+        // inner survived the merge with its expansion state intact.
+        assert!(
+            tree.collect_expanded().contains(&d.join("sub/inner")),
+            "child expansion state preserved across the re-read"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refresh_dir_keeps_children_when_dir_unreadable() {
+        // A directory deleted (or made unreadable) between the watcher event
+        // and the re-read must not have its cached listing wiped to "empty" —
+        // the parent's own refresh prunes the node once the deletion lands.
+        let d = tmpdir("refresh-vanish");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub/kept.txt"), b"x").unwrap();
+        let mut tree = Tree::new(d.clone());
+        tree.expand(&d.join("sub"));
+        fs::remove_dir_all(d.join("sub")).unwrap();
+
+        assert!(!tree.refresh_dir(&d.join("sub")), "unreadable dir: no refresh");
+        let sub = tree.root.find_mut(&d.join("sub")).unwrap();
+        assert!(
+            sub.children.iter().any(|c| c.name == "kept.txt"),
+            "cached listing preserved until the parent refresh prunes the node"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

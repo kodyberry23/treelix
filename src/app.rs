@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -41,10 +42,36 @@ pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Redraw,
-    Fs(HashSet<PathBuf>),
+    Fs(watcher::FsChange),
     Git(GitData),
     Reveal(ipc::Reveal),
 }
+
+/// Result of one live-filter scan of the tree on disk.
+struct LiveScan {
+    /// Inputs the scan depends on; a cached scan is reused only if they match.
+    query: String,
+    root: PathBuf,
+    show_hidden: bool,
+    show_ignored: bool,
+    custom_active: bool,
+    /// Paths to keep visible: matches, their ancestors, and (with
+    /// `live_filter_show_folders`) every directory.
+    visible: Rc<HashSet<PathBuf>>,
+    /// Directories to expand so every match is on screen: the ancestor chains
+    /// of matched entries, shallowest first, deduplicated.
+    expand: Vec<PathBuf>,
+    /// The walk hit its entry cap; matches beyond it are missing.
+    truncated: bool,
+}
+
+/// Upper bound on directory entries examined per filter scan, so one keystroke
+/// can't stall the UI walking a pathological tree (huge unignored vendor dirs).
+const FILTER_WALK_CAP: usize = 50_000;
+/// If a query would auto-expand more directories than this, skip the expansion
+/// (the restrict filter still applies) — exploding thousands of directories for
+/// a one-letter query helps nobody. Typing more letters narrows it under the cap.
+const FILTER_EXPAND_CAP: usize = 500;
 
 pub struct App {
     tree: Tree,
@@ -77,6 +104,14 @@ pub struct App {
     no_bookmark: bool,
     live_filter: Option<String>,
     live_editing: bool,
+    /// Cached result of the last live-filter disk scan, so ordinary row
+    /// refreshes (git updates, redraws) don't re-walk the filesystem. Keyed
+    /// by the scan inputs; invalidated explicitly on filesystem change.
+    live_scan: Option<LiveScan>,
+    /// Expansion state captured when the live filter was armed, restored when
+    /// it is cleared — the filter auto-expands directories to surface matches,
+    /// and that exploration must not permanently rearrange the user's tree.
+    pre_filter_expanded: Option<HashSet<PathBuf>>,
 
     // Helix-aware state
     current_file: Option<PathBuf>,
@@ -109,14 +144,14 @@ impl App {
 
         let (tx, rx) = unbounded();
 
-        // File watcher → Fs events (carrying the set of changed paths).
-        let (fs_tx, fs_rx) = unbounded::<HashSet<PathBuf>>();
+        // File watcher → Fs events (changed-path sets or full-rescan markers).
+        let (fs_tx, fs_rx) = unbounded::<watcher::FsChange>();
         let watcher = watcher::watch(root.clone(), fs_tx);
         {
             let tx = tx.clone();
             thread::spawn(move || {
-                while let Ok(paths) = fs_rx.recv() {
-                    if tx.send(AppEvent::Fs(paths)).is_err() {
+                while let Ok(change) = fs_rx.recv() {
+                    if tx.send(AppEvent::Fs(change)).is_err() {
                         break;
                     }
                 }
@@ -161,6 +196,8 @@ impl App {
             no_bookmark: false,
             live_filter: None,
             live_editing: false,
+            live_scan: None,
+            pre_filter_expanded: None,
             current_file: None,
             opened: HashSet::new(),
             last_input: None,
@@ -258,10 +295,16 @@ impl App {
             AppEvent::Key(k) => self.on_key(k),
             AppEvent::Mouse(m) => self.on_mouse(m),
             AppEvent::Redraw => {}
-            AppEvent::Fs(paths) => self.reload_from_paths(&paths),
+            AppEvent::Fs(watcher::FsChange::Paths(paths)) => self.reload_from_paths(&paths),
+            // The OS dropped events (FSEvents "must scan subdirs"): the paths
+            // we have are incomplete, so re-read every expanded directory.
+            AppEvent::Fs(watcher::FsChange::Rescan) => self.reload_from_disk(),
             AppEvent::Git(data) => {
                 self.git = data;
                 self.tree.apply_git(&self.git);
+                // The filter scan prunes on git-ignored status, so cached
+                // results computed against the old statuses are stale.
+                self.live_scan = None;
                 self.refresh_rows(self.selected_path());
             }
             AppEvent::Reveal(ipc::Reveal { path, follow }) => {
@@ -348,8 +391,7 @@ impl App {
     fn on_live_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.live_filter = None;
-                self.live_editing = false;
+                self.clear_live_filter();
                 self.refresh_rows(self.selected_path());
             }
             KeyCode::Enter => {
@@ -359,13 +401,13 @@ impl App {
                 if let Some(q) = &mut self.live_filter {
                     q.pop();
                 }
-                self.refresh_rows(None);
+                self.on_live_query_changed();
             }
             KeyCode::Char(c) => {
                 if let Some(q) = &mut self.live_filter {
                     q.push(c);
                 }
-                self.refresh_rows(None);
+                self.on_live_query_changed();
             }
             _ => {}
         }
@@ -438,14 +480,9 @@ impl App {
             Action::ToggleNoBuffer => self.toggle_filter(Filter::NoBuffer),
             Action::ToggleNoBookmark => self.toggle_filter(Filter::NoBookmark),
             Action::ToggleGroupEmpty => self.toggle_group_empty(),
-            Action::LiveFilterStart => {
-                self.live_filter = Some(String::new());
-                self.live_editing = true;
-                self.refresh_rows(self.selected_path());
-            }
+            Action::LiveFilterStart => self.start_live_filter(),
             Action::LiveFilterClear => {
-                self.live_filter = None;
-                self.live_editing = false;
+                self.clear_live_filter();
                 self.refresh_rows(self.selected_path());
             }
             Action::SearchNode => {
@@ -465,8 +502,7 @@ impl App {
                 // Esc clears, in priority: an active live filter, then a visual
                 // selection, then any pending key sequence / status message.
                 if self.live_filter.is_some() {
-                    self.live_filter = None;
-                    self.live_editing = false;
+                    self.clear_live_filter();
                     self.refresh_rows(self.selected_path());
                     self.set_status("filter cleared");
                 } else if !self.selection.is_empty() {
@@ -728,6 +764,14 @@ impl App {
     }
 
     fn set_root(&mut self, path: PathBuf) {
+        // A live filter is scoped to the root it was typed under; carrying it
+        // (or its expansion snapshot) across a cd would later restore the OLD
+        // root's snapshot onto the new tree — collapse_all with nothing valid
+        // to re-expand. Drop all filter state instead.
+        self.live_filter = None;
+        self.live_editing = false;
+        self.live_scan = None;
+        self.pre_filter_expanded = None;
         self.tree.set_root(path);
         self.tree.apply_git(&self.git);
         self.refresh_rows(None);
@@ -1106,6 +1150,7 @@ impl App {
         let sel = self.selected_path();
         self.tree.reload_preserving(&expanded);
         self.tree.apply_git(&self.git);
+        self.live_scan = None; // disk changed: cached filter matches are stale
         self.refresh_rows(sel);
         self.spawn_git();
     }
@@ -1134,8 +1179,16 @@ impl App {
                 touched = true;
             }
         }
+        // Disk changed: cached filter matches are stale even when no LOADED
+        // directory was touched — the change may sit inside a never-expanded
+        // directory that the filter's disk walk still covers.
+        self.live_scan = None;
         if touched {
             self.tree.apply_git(&self.git);
+            self.refresh_rows(sel);
+        } else if self.live_filter.is_some() {
+            // Nothing in the loaded tree moved, but the filter view may
+            // include results from unloaded directories — rebuild it.
             self.refresh_rows(sel);
         }
         self.spawn_git();
@@ -1153,9 +1206,12 @@ impl App {
     // ── Selection / rows ──────────────────────────────────────────────────────
 
     fn refresh_rows(&mut self, preserve: Option<PathBuf>) {
-        // Build restrict sets (kept alive for the flatten borrow).
-        let live_query = self.live_filter.clone();
-        let live_set = live_query.as_ref().map(|q| self.compute_match_set(q));
+        // Build restrict sets (kept alive for the flatten borrow). An empty
+        // query is "no restriction yet" — scanning for it would walk the whole
+        // tree only to admit everything (and, past the walk cap, silently hide
+        // rows that were visible before `f` was even pressed).
+        let live_query = self.live_filter.clone().filter(|q| !q.is_empty());
+        let live_set = live_query.as_ref().map(|q| self.live_matches(q));
         let bookmark_set = if self.no_bookmark {
             Some(self.with_ancestors(self.marks.all()))
         } else {
@@ -1168,7 +1224,7 @@ impl App {
         };
         let mut restricts: Vec<&HashSet<PathBuf>> = Vec::new();
         if let Some(s) = &live_set {
-            restricts.push(s);
+            restricts.push(s.as_ref());
         }
         if let Some(s) = &bookmark_set {
             restricts.push(s);
@@ -1202,40 +1258,220 @@ impl App {
         });
     }
 
-    fn compute_match_set(&mut self, query: &str) -> HashSet<PathBuf> {
-        let root = self.tree.root.path.clone();
-        let mut set = HashSet::new();
-        let all = self.tree.all_paths();
-        if query.is_empty() {
-            for (p, _, _) in all {
-                set.insert(p);
-            }
-            return set;
+    /// The live-filter restrict set for `query`, re-scanning the disk only when
+    /// the cached scan no longer matches the current inputs. The set is behind
+    /// an `Rc` so per-refresh reuse is a pointer copy, not a deep clone.
+    fn live_matches(&mut self, query: &str) -> Rc<HashSet<PathBuf>> {
+        self.ensure_live_scan(query);
+        Rc::clone(&self.live_scan.as_ref().unwrap().visible)
+    }
+
+    fn ensure_live_scan(&mut self, query: &str) {
+        let fresh = self.live_scan.as_ref().is_some_and(|s| {
+            s.query == query
+                && s.root == self.tree.root.path
+                && s.show_hidden == self.tree.show_hidden
+                && s.show_ignored == self.tree.show_ignored
+                && s.custom_active == self.custom_active
+        });
+        if !fresh {
+            self.live_scan = Some(self.scan_disk_for_filter(query));
         }
-        // Mirror nvim-tree's `always_show_folders`: keep every directory visible
-        // so the tree stays navigable, and match only files by name. (The filter
-        // searches loaded nodes only — expand-all `E` first for a global filter.)
-        let always_show_folders = self.config.live_filter_show_folders;
-        let pat = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    }
+
+    /// Walk the tree on disk from the root — not just the lazily-loaded nodes —
+    /// honoring the active visibility toggles. This is what lets the filter
+    /// find files inside directories that were never expanded. Returns the
+    /// visible set (matches + ancestors + folder freebies) and the directories
+    /// to expand so matches actually render.
+    fn scan_disk_for_filter(&mut self, query: &str) -> LiveScan {
+        let root = self.tree.root.path.clone();
+        let show_hidden = self.tree.show_hidden;
+        let show_ignored = self.tree.show_ignored;
+        // Mirror nvim-tree's `always_show_folders`: keep every directory
+        // visible so the tree stays navigable, matching only entries by name.
+        let show_folders = self.config.live_filter_show_folders;
+        let pat = (!query.is_empty())
+            .then(|| Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart));
+
+        // Git-ignored pruning only works when git data exists. On a non-git
+        // root, statuses is permanently empty, so fall back to the watcher's
+        // high-churn dir names — otherwise the walk burns its entry cap inside
+        // node_modules/target and drops real matches past the cap. (For git
+        // roots the pre-first-scan window is covered by the AppEvent::Git
+        // cache invalidation: the scan simply reruns once statuses arrive.)
+        let prune_components = self.git.toplevel.is_none();
+
+        let mut visible = HashSet::new();
+        let mut expand: Vec<PathBuf> = Vec::new();
+        let mut seen_expand = HashSet::new();
+        // Canonical targets of symlinked dirs already descended into, so a
+        // symlink loop (a/link -> a) terminates.
+        let mut visited_links = HashSet::new();
+        let mut walked = 0usize;
+        let mut truncated = false;
         let mut buf = Vec::new();
-        for (path, name, is_dir) in all {
-            let keep = (is_dir && always_show_folders)
-                || pat
-                    .score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
-                    .is_some();
-            if keep {
-                set.insert(path.clone());
-                let mut cur = path.as_path();
-                while let Some(parent) = cur.parent() {
-                    if parent == root || !parent.starts_with(&root) {
-                        break;
+        let mut stack = vec![root.clone()];
+        'walk: while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                walked += 1;
+                if walked > FILTER_WALK_CAP {
+                    truncated = true;
+                    break 'walk;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                if !show_hidden && name.starts_with('.') {
+                    continue;
+                }
+                if !show_ignored && self.git.statuses.get(&path) == Some(&GitStatus::Ignored) {
+                    continue;
+                }
+                if self.custom_active
+                    && self.config.exclude.iter().any(|p| name.contains(p.as_str()))
+                {
+                    continue;
+                }
+                let ft = entry.file_type().ok();
+                let is_plain_dir = ft.is_some_and(|t| t.is_dir());
+                // Match the tree's NodeKind semantics: a symlink to a directory
+                // is a directory for visibility and descent.
+                let is_link_dir = ft.is_some_and(|t| t.is_symlink())
+                    && std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+                let is_dir = is_plain_dir || is_link_dir;
+                let matched = pat.as_ref().is_none_or(|p| {
+                    p.score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
+                        .is_some()
+                });
+                if matched || (is_dir && show_folders) {
+                    visible.insert(path.clone());
+                    let mut cur = path.as_path();
+                    while let Some(parent) = cur.parent() {
+                        if parent == root || !parent.starts_with(&root) {
+                            break;
+                        }
+                        if !visible.insert(parent.to_path_buf()) {
+                            break; // ancestors above are already recorded
+                        }
+                        cur = parent;
                     }
-                    set.insert(parent.to_path_buf());
-                    cur = parent;
+                }
+                if matched && pat.is_some() {
+                    // Expansion chain: every directory between the root and the
+                    // match, so the match renders. Shallow-first ordering falls
+                    // out of sorting below.
+                    let mut cur = path.parent();
+                    while let Some(p) = cur {
+                        if !p.starts_with(&root) {
+                            break;
+                        }
+                        if !seen_expand.insert(p.to_path_buf()) {
+                            break; // this chain is already recorded to the root
+                        }
+                        expand.push(p.to_path_buf());
+                        if p == root {
+                            break;
+                        }
+                        cur = p.parent();
+                    }
+                }
+                if is_dir {
+                    if prune_components && watcher::is_high_churn_name(&name) {
+                        continue; // shown/matched above, but never descended
+                    }
+                    if is_link_dir {
+                        // Descend only through symlinks whose target we have
+                        // not walked yet — unresolvable or repeated targets
+                        // (cycles) are skipped.
+                        if let Ok(real) = std::fs::canonicalize(&path) {
+                            if visited_links.insert(real) {
+                                stack.push(path);
+                            }
+                        }
+                    } else {
+                        stack.push(path);
+                    }
                 }
             }
         }
-        set
+        expand.sort_by_key(|p| p.components().count());
+        LiveScan {
+            query: query.to_string(),
+            root,
+            show_hidden,
+            show_ignored,
+            custom_active: self.custom_active,
+            visible: Rc::new(visible),
+            expand,
+            truncated,
+        }
+    }
+
+    /// Called whenever the live-filter query text changes: re-scan, then expand
+    /// the tree to the matches (bounded) so they are visible immediately.
+    fn on_live_query_changed(&mut self) {
+        let Some(query) = self.live_filter.clone() else {
+            return;
+        };
+        if query.is_empty() {
+            // No restriction yet — nothing to scan or expand.
+            self.live_scan = None;
+            self.refresh_rows(None);
+            return;
+        }
+        self.live_scan = Some(self.scan_disk_for_filter(&query));
+        let scan = self.live_scan.as_ref().unwrap();
+        let truncated = scan.truncated;
+        let over_cap = scan.expand.len() > FILTER_EXPAND_CAP;
+        let expand: Vec<PathBuf> = if over_cap {
+            Vec::new()
+        } else {
+            scan.expand.clone()
+        };
+        if !expand.is_empty() {
+            let already = self.tree.collect_expanded();
+            for dir in expand.iter().filter(|d| !already.contains(*d)) {
+                self.tree.expand(dir);
+            }
+            self.tree.apply_git(&self.git);
+        }
+        if truncated {
+            self.set_status("filter: tree too large, results incomplete");
+        } else if over_cap {
+            // Matches exist but span too many directories to explode open;
+            // without this message the mostly-collapsed view reads as "no
+            // results".
+            self.set_status(format!(
+                "filter: matches in {} dirs — type more to narrow",
+                self.live_scan.as_ref().unwrap().expand.len()
+            ));
+        }
+        self.refresh_rows(None);
+    }
+
+    /// Arm the live filter, snapshotting the expansion state to restore later.
+    fn start_live_filter(&mut self) {
+        if self.pre_filter_expanded.is_none() {
+            self.pre_filter_expanded = Some(self.tree.collect_expanded());
+        }
+        self.live_filter = Some(String::new());
+        self.live_editing = true;
+        self.refresh_rows(self.selected_path());
+    }
+
+    /// Drop the live filter and put the tree's expansion state back the way it
+    /// was before filtering started.
+    fn clear_live_filter(&mut self) {
+        self.live_filter = None;
+        self.live_editing = false;
+        self.live_scan = None;
+        if let Some(expanded) = self.pre_filter_expanded.take() {
+            self.tree.restore_expanded(&expanded);
+            self.tree.apply_git(&self.git);
+        }
     }
 
     fn with_ancestors(&self, base: &HashSet<PathBuf>) -> HashSet<PathBuf> {
@@ -1688,6 +1924,109 @@ mod tests {
         app.handle_event(AppEvent::Redraw);
         assert!(app.pending_reveal.is_none(), "pending reveal consumed");
         assert!(deep_visible(&app, &deep), "tree synced to Helix's buffer");
+    }
+
+    fn type_filter(app: &mut App, query: &str) {
+        app.on_key(key(KeyCode::Char('f'))); // LiveFilterStart
+        for c in query.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn live_filter_finds_file_in_collapsed_dir() {
+        // Regression: the filter used to search only lazily-loaded nodes and
+        // never expanded anything, so with `sub` collapsed (its children not
+        // even loaded), filtering for "deep" showed nothing.
+        let (mut app, _root, deep) = app_with_tree();
+        assert!(!deep_visible(&app, &deep), "sub collapsed at startup");
+        type_filter(&mut app, "deep");
+        assert!(
+            deep_visible(&app, &deep),
+            "filter must scan disk and auto-expand to the match; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        // The non-matching sibling file is filtered out.
+        assert!(!app.rows.iter().any(|r| r.name == "a.txt"));
+    }
+
+    #[test]
+    fn clearing_filter_restores_expansion_state() {
+        let (mut app, _root, deep) = app_with_tree();
+        type_filter(&mut app, "deep");
+        assert!(deep_visible(&app, &deep), "filter expanded sub");
+        app.on_key(key(KeyCode::Esc)); // clear while editing
+        assert!(app.live_filter.is_none());
+        assert!(
+            !deep_visible(&app, &deep),
+            "sub must be collapsed again after the filter is cleared"
+        );
+        assert!(app.rows.iter().any(|r| r.name == "a.txt"), "full tree is back");
+    }
+
+    #[test]
+    fn narrowing_query_after_enter_persists() {
+        // Enter keeps the filter active for navigation; rows stay restricted.
+        let (mut app, _root, deep) = app_with_tree();
+        type_filter(&mut app, "deep");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.live_filter.is_some(), "Enter keeps the filter");
+        assert!(deep_visible(&app, &deep));
+        // F (LiveFilterClear) restores the pre-filter tree.
+        app.on_key(key(KeyCode::Char('F')));
+        assert!(app.live_filter.is_none());
+        assert!(!deep_visible(&app, &deep));
+    }
+
+    #[test]
+    fn empty_filter_query_restricts_nothing() {
+        // Pressing `f` alone must not scan or hide anything: an empty query is
+        // "no restriction yet", and on huge trees a truncated scan-of-everything
+        // used as a restrict set would hide rows that were just visible.
+        let (mut app, _root, _deep) = app_with_tree();
+        let before: Vec<PathBuf> = app.rows.iter().map(|r| r.path.clone()).collect();
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(app.live_scan.is_none(), "no scan for an empty query");
+        let after: Vec<PathBuf> = app.rows.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(before, after, "rows unchanged by an empty filter");
+    }
+
+    #[test]
+    fn cd_drops_live_filter_state() {
+        // A filter parked with Enter must not survive a cd: restoring the old
+        // root's expansion snapshot onto the new tree would collapse everything.
+        let (mut app, root, deep) = app_with_tree();
+        type_filter(&mut app, "deep");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.live_filter.is_some());
+        app.set_root(root.join("sub"));
+        assert!(app.live_filter.is_none(), "cd clears the filter");
+        assert!(app.pre_filter_expanded.is_none(), "cd drops the stale snapshot");
+        assert!(
+            app.rows.iter().any(|r| r.path == deep),
+            "new root renders normally after cd"
+        );
+    }
+
+    #[test]
+    fn fs_rescan_reloads_expanded_tree() {
+        // An OS-level event overflow (FSEvents "must scan subdirs") arrives as
+        // FsChange::Rescan with no usable paths; the whole expanded tree must
+        // be re-read or the missed changes stay invisible forever.
+        let (mut app, root, deep) = app_with_tree();
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: deep.clone(),
+            follow: false,
+        }));
+        assert!(deep_visible(&app, &deep), "sub expanded");
+
+        // Change the tree on disk with no per-path notification.
+        fs::write(root.join("sub/missed.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        assert!(
+            app.rows.iter().any(|r| r.path == root.join("sub/missed.txt")),
+            "rescan re-reads expanded dirs and surfaces the missed file"
+        );
     }
 
     #[test]

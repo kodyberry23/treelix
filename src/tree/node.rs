@@ -33,6 +33,11 @@ pub struct Node {
     pub expanded: bool,
     /// Whether children have been read from disk yet (directories only).
     pub loaded: bool,
+    /// The directory's own mtime observed when `children` were last read.
+    /// A directory's mtime changes exactly when entries are added, removed,
+    /// or renamed, so comparing it against a fresh stat is a one-syscall
+    /// staleness check before re-reading the listing on expand.
+    pub loaded_mtime: Option<std::time::SystemTime>,
     pub children: Vec<Node>,
     pub executable: bool,
     /// Per-file status, or propagated highest-priority status for directories.
@@ -57,6 +62,7 @@ impl Node {
             kind,
             expanded: false,
             loaded: false,
+            loaded_mtime: None,
             children: Vec::new(),
             executable,
             git: None,
