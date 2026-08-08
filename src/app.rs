@@ -593,10 +593,19 @@ impl App {
                 // Resolve relative to the tree root (absolute paths honored),
                 // mirroring RenameFull, so editing the prefix down to nothing
                 // creates at the root. ops::create makes intermediate dirs.
+                // An explicitly absolute path is an intentional out-of-tree
+                // action; a RELATIVE one must stay inside the root — `..`
+                // segments would otherwise silently create escaped parents
+                // the explorer can never show.
                 let target = if Path::new(clean).is_absolute() {
                     PathBuf::from(clean)
                 } else {
-                    self.tree.root.path.join(clean)
+                    let t = normalize_lexical(&self.tree.root.path.join(clean));
+                    if !t.starts_with(&self.tree.root.path) {
+                        self.set_status("create rejected: path escapes the tree root");
+                        return;
+                    }
+                    t
                 };
                 match crate::tree::ops::create(&target, is_dir) {
                     Ok(()) => {
@@ -618,11 +627,17 @@ impl App {
                 self.do_rename(&path, &final_name);
             }
             InputKind::RenameFull { path } => {
-                // Interpret value relative to the tree root if not absolute.
+                // Interpret value relative to the tree root if not absolute;
+                // relative values must stay inside the root (see Create).
                 let target = if Path::new(&value).is_absolute() {
                     PathBuf::from(&value)
                 } else {
-                    self.tree.root.path.join(&value)
+                    let t = normalize_lexical(&self.tree.root.path.join(&value));
+                    if !t.starts_with(&self.tree.root.path) {
+                        self.set_status("rename rejected: path escapes the tree root");
+                        return;
+                    }
+                    t
                 };
                 match crate::tree::ops::rename(&path, &target) {
                     Ok(()) => {
@@ -639,7 +654,19 @@ impl App {
 
     fn do_rename(&mut self, path: &Path, new_name: &str) {
         let parent = path.parent().unwrap_or(Path::new("/"));
-        let target = parent.join(new_name);
+        // The rename prompt takes a NAME (slashes allowed for subdir moves);
+        // an absolute value or a `..` chain escaping the tree is a typo or an
+        // injection, not a rename — reject rather than clobber something the
+        // explorer can't show.
+        if Path::new(new_name).is_absolute() {
+            self.set_status("rename rejected: absolute path (use rename-full)");
+            return;
+        }
+        let target = normalize_lexical(&parent.join(new_name));
+        if !target.starts_with(&self.tree.root.path) {
+            self.set_status("rename rejected: path escapes the tree root");
+            return;
+        }
         match crate::tree::ops::rename(path, &target) {
             Ok(()) => {
                 self.reload_from_disk();
@@ -651,34 +678,45 @@ impl App {
     }
 
     fn run_confirm(&mut self, kind: ConfirmKind) {
-        let result: std::io::Result<usize> = match kind {
-            ConfirmKind::Delete(p) => crate::tree::ops::remove(&p).map(|_| 1),
-            ConfirmKind::Trash(p) => crate::tree::ops::trash(&p).map(|_| 1),
-            ConfirmKind::BulkDelete(paths) => {
-                let n = paths.len();
-                self.marks.remove_all(&paths);
-                self.selection.clear();
-                paths
-                    .iter()
-                    .try_for_each(|p| crate::tree::ops::remove(p))
-                    .map(|_| n)
-            }
-            ConfirmKind::BulkTrash(paths) => {
-                let n = paths.len();
-                self.marks.remove_all(&paths);
-                self.selection.clear();
-                paths
-                    .iter()
-                    .try_for_each(|p| crate::tree::ops::trash(p))
-                    .map(|_| n)
-            }
+        let (paths, use_trash) = match kind {
+            ConfirmKind::Delete(p) => (vec![p], false),
+            ConfirmKind::Trash(p) => (vec![p], true),
+            ConfirmKind::BulkDelete(paths) => (paths, false),
+            ConfirmKind::BulkTrash(paths) => (paths, true),
         };
-        match result {
-            Ok(n) => {
-                self.reload_from_disk();
-                self.set_status(format!("removed {n} item(s)"));
+        // Run every op, then prune bookkeeping for the paths that actually
+        // went away. Clearing marks/selection up front (or aborting the batch
+        // on the first error) destroys the only record of what still exists —
+        // a partial failure must leave the survivors marked and retryable.
+        let total = paths.len();
+        let mut removed: Vec<PathBuf> = Vec::new();
+        let mut first_err: Option<String> = None;
+        for p in &paths {
+            let res = if use_trash {
+                crate::tree::ops::trash(p)
+            } else {
+                crate::tree::ops::remove(p)
+            };
+            match res {
+                Ok(()) => removed.push(p.clone()),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.to_string());
+                    }
+                }
             }
-            Err(e) => self.set_status(format!("remove failed: {e}")),
+        }
+        self.marks.remove_all(&removed);
+        for p in &removed {
+            self.selection.remove(p);
+        }
+        self.reload_from_disk();
+        match first_err {
+            None => self.set_status(format!("removed {total} item(s)")),
+            Some(e) => self.set_status(format!(
+                "removed {} of {total} ({e})",
+                removed.len()
+            )),
         }
     }
 
@@ -913,7 +951,11 @@ impl App {
         let dest = self.current_dir_context();
         let op = self.clipboard.op;
         let paths = self.clipboard.paths.clone();
+        let total = paths.len();
         let mut last = None;
+        let mut ok = 0usize;
+        let mut moved: Vec<PathBuf> = Vec::new();
+        let mut first_err: Option<String> = None;
         for src in &paths {
             let target = crate::tree::ops::paste_target(&dest, src);
             let res = match op {
@@ -921,12 +963,35 @@ impl App {
                 _ => crate::tree::ops::copy(src, &target),
             };
             match res {
-                Ok(()) => last = Some(target),
-                Err(e) => self.set_status(format!("paste failed: {e}")),
+                Ok(()) => {
+                    ok += 1;
+                    if op == Some(ClipOp::Cut) {
+                        // Bookmarks follow the file to its new home.
+                        self.marks.remap(src, &target);
+                        self.selection.remove(src);
+                        moved.push(src.clone());
+                    }
+                    last = Some(target);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.to_string());
+                    }
+                }
             }
         }
         if op == Some(ClipOp::Cut) {
-            self.clipboard.clear();
+            // Keep only the items that did NOT move, so the user can retry the
+            // failures; a clean sweep clears the clipboard as before.
+            self.clipboard.paths.retain(|p| !moved.contains(p));
+            if self.clipboard.paths.is_empty() {
+                self.clipboard.clear();
+            }
+        }
+        // One truthful summary line instead of a per-item churn of statuses.
+        match first_err {
+            None => self.set_status(format!("pasted {total} item(s)")),
+            Some(e) => self.set_status(format!("pasted {ok} of {total} ({e})")),
         }
         self.reload_from_disk();
         if let Some(t) = last {
@@ -1038,8 +1103,28 @@ impl App {
         } else {
             ConfirmKind::BulkDelete(paths.clone())
         };
+        // Name what is about to be destroyed: bookmarks can be stale (set in
+        // an earlier session, or pointing where a file was later recreated),
+        // and a bare count gives the user nothing to catch that with.
+        let mut names: Vec<String> = paths
+            .iter()
+            .take(3)
+            .map(|p| {
+                p.strip_prefix(&self.tree.root.path)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        if paths.len() > names.len() {
+            names.push(format!("+{} more", paths.len() - names.len()));
+        }
         self.overlay = Overlay::Confirm(ConfirmState {
-            prompt: format!("{verb} {} bookmarked item(s)?", paths.len()),
+            prompt: format!(
+                "{verb} {} bookmarked item(s)? [{}]",
+                paths.len(),
+                names.join(", ")
+            ),
             kind,
         });
     }
@@ -1051,16 +1136,31 @@ impl App {
             return;
         }
         let dest = self.current_dir_context();
-        let mut moved = 0;
+        let total = paths.len();
+        let mut moved: Vec<PathBuf> = Vec::new();
+        let mut first_err: Option<String> = None;
         for src in &paths {
             let target = crate::tree::ops::paste_target(&dest, src);
-            if crate::tree::ops::rename(src, &target).is_ok() {
-                moved += 1;
+            match crate::tree::ops::rename(src, &target) {
+                Ok(()) => moved.push(src.clone()),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.to_string());
+                    }
+                }
             }
         }
-        self.marks.remove_all(&paths);
+        // Only the bookmarks that actually moved are done with; failures stay
+        // bookmarked so the user can see and retry them.
+        self.marks.remove_all(&moved);
         self.reload_from_disk();
-        self.set_status(format!("moved {moved} bookmarked item(s)"));
+        match first_err {
+            None => self.set_status(format!("moved {total} bookmarked item(s)")),
+            Some(e) => self.set_status(format!(
+                "moved {} of {total} bookmarked item(s) ({e})",
+                moved.len()
+            )),
+        }
     }
 
     // ── Filters ───────────────────────────────────────────────────────────────
@@ -1810,6 +1910,23 @@ fn human_ago(t: SystemTime) -> String {
     }
 }
 
+/// Lexically resolve `.` and `..` components (no filesystem access), so a
+/// user-typed relative path can be containment-checked against the tree root
+/// before anything touches the disk.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2027,6 +2144,63 @@ mod tests {
             app.rows.iter().any(|r| r.path == deep),
             "new root renders normally after cd"
         );
+    }
+
+    #[test]
+    fn bulk_delete_partial_failure_keeps_survivor_marks() {
+        // Regression: marks/selection were cleared BEFORE the ops ran and the
+        // batch aborted on the first error, so a partial failure destroyed
+        // the record of what still exists.
+        let (mut app, root, _deep) = app_with_tree();
+        let a = root.join("a.txt");
+        let ghost = root.join("ghost.txt"); // never exists on disk
+        app.marks.toggle(&a);
+        app.marks.toggle(&ghost);
+        app.run_confirm(ConfirmKind::BulkDelete(vec![ghost.clone(), a.clone()]));
+        assert!(!a.exists(), "existing file removed despite earlier failure");
+        assert!(!app.marks.contains(&a), "removed path unmarked");
+        assert!(
+            app.marks.contains(&ghost),
+            "failed path keeps its mark for retry"
+        );
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("1 of 2"),
+            "status reports partial result: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn create_rejects_root_escape() {
+        let (mut app, root, _deep) = app_with_tree();
+        app.submit_input(InputState::new(
+            " create ",
+            "../escaped.txt".to_string(),
+            InputKind::Create,
+        ));
+        assert!(
+            !root.parent().unwrap().join("escaped.txt").exists(),
+            "no file may be created outside the root"
+        );
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("rejected"),
+            "status explains the rejection: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn rename_rejects_root_escape_and_existing_target() {
+        let (mut app, root, _deep) = app_with_tree();
+        // Escape via `..` in the rename prompt.
+        app.do_rename(&root.join("a.txt"), "../stolen.txt");
+        assert!(root.join("a.txt").exists(), "source untouched");
+        assert!(!root.parent().unwrap().join("stolen.txt").exists());
+        // Renaming onto an existing file is refused (ops-level guard).
+        fs::write(root.join("b.txt"), b"other").unwrap();
+        app.do_rename(&root.join("a.txt"), "b.txt");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"other", "no overwrite");
+        assert!(root.join("a.txt").exists());
     }
 
     #[test]

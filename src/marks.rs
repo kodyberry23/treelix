@@ -59,6 +59,16 @@ impl Marks {
         self.save();
     }
 
+    /// Point a bookmark at a path's new location (after a move), so the mark
+    /// follows the file instead of dangling on — and later deleting — whatever
+    /// is recreated at the old path.
+    pub fn remap(&mut self, old: &Path, new: &Path) {
+        if self.set.remove(old) {
+            self.set.insert(new.to_path_buf());
+            self.save();
+        }
+    }
+
     fn save(&self) {
         if let Some(p) = &self.persist_path {
             if let Some(parent) = p.parent() {
