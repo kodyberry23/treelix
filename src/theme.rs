@@ -304,10 +304,27 @@ pub mod helix {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("projects/helix/runtime/themes"))
     }
 
-    /// Child keys override parent keys.
-    fn merge_themes(mut parent: toml::Value, child: toml::Value) -> toml::Value {
+    /// Merge a child theme onto its parent. Child keys override parent keys,
+    /// EXCEPT `[palette]`, which is deep-merged (child colors override, parent
+    /// colors are retained) — matching Helix's own inheritance. A partial
+    /// palette in a child theme (monokai_aqua, gruvbox_dark_soft, the
+    /// catppuccin variants, ...) must not wipe the parent's colors, or
+    /// `--theme helix` silently renders the built-in theme.
+    pub(super) fn merge_themes(mut parent: toml::Value, child: toml::Value) -> toml::Value {
         if let (Some(p), Some(c)) = (parent.as_table_mut(), child.as_table()) {
             for (k, v) in c {
+                if k == "palette" {
+                    // Deep-merge when both sides have a palette table; parent
+                    // with no palette falls through to child-wins below.
+                    if let (Some(pp), Some(cp)) =
+                        (p.get_mut(k).and_then(|e| e.as_table_mut()), v.as_table())
+                    {
+                        for (ck, cv) in cp {
+                            pp.insert(ck.clone(), cv.clone());
+                        }
+                        continue;
+                    }
+                }
                 p.insert(k.clone(), v.clone());
             }
         }
@@ -325,6 +342,31 @@ mod tests {
         // directory should be the frost1 cyan, bold.
         assert_eq!(t.directory.fg, Some(Color::Rgb(0x74, 0xBC, 0xD9)));
         assert!(t.directory.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn merge_deep_merges_palette_but_overrides_scopes() {
+        let parent = toml::from_str::<toml::Value>(
+            "[palette]\nred = \"#f00\"\nblue = \"#00f\"\n\n[ui]\nbg = \"red\"\n",
+        )
+        .unwrap();
+        // Child brings a PARTIAL palette (only red) and overrides one scope.
+        let child = toml::from_str::<toml::Value>(
+            "inherits = \"parent\"\n[palette]\nred = \"#e00\"\n\n[ui]\nbg = \"blue\"\n",
+        )
+        .unwrap();
+        let merged = helix::merge_themes(parent, child);
+        let pal = merged.get("palette").unwrap().as_table().unwrap();
+        // Child's red wins, parent's blue survives (deep merge).
+        assert_eq!(pal.get("red").unwrap().as_str(), Some("#e00"));
+        assert_eq!(
+            pal.get("blue").unwrap().as_str(),
+            Some("#00f"),
+            "parent palette color must survive a partial child palette"
+        );
+        // Scope value is child-overridden wholesale (not merged).
+        let ui = merged.get("ui").unwrap().as_table().unwrap();
+        assert_eq!(ui.get("bg").unwrap().as_str(), Some("blue"));
     }
 
     #[test]

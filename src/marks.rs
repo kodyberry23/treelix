@@ -77,10 +77,22 @@ impl Marks {
             let mut lines: Vec<String> = self
                 .set
                 .iter()
+                // The store is newline-delimited; a path containing a newline
+                // would corrupt it (and split into phantom bookmarks on load).
+                // Such paths are exceedingly rare — skip them rather than
+                // write a file that can't be read back.
+                .filter(|p| !p.as_os_str().to_string_lossy().contains('\n'))
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect();
             lines.sort();
-            let _ = std::fs::write(p, lines.join("\n"));
+            // Write to a unique temp file and atomically rename into place, so
+            // a concurrent instance's save can't interleave with ours and
+            // leave a truncated/half-written bookmarks file. The temp name is
+            // pid-scoped to avoid two instances colliding on the temp path.
+            let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+            if std::fs::write(&tmp, lines.join("\n")).is_ok() && std::fs::rename(&tmp, p).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 }

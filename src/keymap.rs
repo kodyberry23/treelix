@@ -73,10 +73,18 @@ pub enum Action {
 /// is in progress).
 pub fn resolve(key: KeyEvent, pending: &str) -> (Action, String) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let none = String::new();
 
-    // Continue an in-progress multi-key sequence.
+    // Continue an in-progress multi-key sequence — but only for UNMODIFIED
+    // keys. A Ctrl/Alt-chord arriving mid-sequence (e.g. Ctrl-V while a `bm`
+    // prefix is pending) must not be matched on its bare code, which would
+    // fire BulkMove instead of the vsplit the user asked for. Abandon the
+    // pending sequence instead, so the modified key is inert this press.
     if !pending.is_empty() {
+        if ctrl || alt {
+            return (Action::None, none);
+        }
         return resolve_pending(pending, key);
     }
 
@@ -253,6 +261,20 @@ mod tests {
         assert_eq!(resolve(key('t'), "b").0, Action::BulkTrash);
         // bmv is three keys.
         assert_eq!(resolve(key('m'), "b").1, "bm");
+        assert_eq!(resolve(key('v'), "bm").0, Action::BulkMove);
+    }
+
+    #[test]
+    fn modified_key_cancels_pending_chord() {
+        // Regression: Ctrl-V while a `bm` prefix is pending matched on the bare
+        // 'v' code and fired BulkMove. A modified key must abandon the chord,
+        // not complete it.
+        assert_eq!(resolve(ctrl('v'), "bm"), (Action::None, String::new()));
+        assert_eq!(resolve(ctrl('d'), "b"), (Action::None, String::new()));
+        // Alt too.
+        let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+        assert_eq!(resolve(alt_v, "bm"), (Action::None, String::new()));
+        // A plain key still completes the chord.
         assert_eq!(resolve(key('v'), "bm").0, Action::BulkMove);
     }
 }

@@ -61,11 +61,14 @@ pub enum GitStatus {
     /// Lowest priority — only shown when explicitly toggled on.
     Ignored,
     Untracked,
-    Conflict,
     Deleted,
     Renamed,
     Dirty,
     Staged,
+    /// Highest priority: a merge conflict must never be masked by a staged or
+    /// dirty sibling when propagated to a parent directory — it is the most
+    /// urgent state to surface.
+    Conflict,
 }
 
 impl GitStatus {
@@ -138,10 +141,16 @@ pub fn toplevel(root: &Path) -> Option<PathBuf> {
 }
 
 /// Run `git status` for the repo containing `root` and return per-path statuses.
-/// Returns an empty (toplevel: None) result when `root` is not a git repo.
-pub fn scan(root: &Path) -> GitData {
+///
+/// Returns `Some(GitData::default())` (toplevel: None) when `root` is not a git
+/// repo — a legitimate empty result the caller applies to clear stale glyphs.
+/// Returns `None` when a `git status` was attempted but FAILED or timed out:
+/// that is NOT the same as a clean repo, and the caller must keep its existing
+/// statuses rather than wiping every glyph (and, with the git-clean filter
+/// active, emptying the whole tree).
+pub fn scan(root: &Path) -> Option<GitData> {
     let Some(top) = toplevel(root) else {
-        return GitData::default();
+        return Some(GitData::default());
     };
 
     let mut cmd = Command::new("git");
@@ -167,15 +176,15 @@ pub fn scan(root: &Path) -> GitData {
             "--untracked-files=all",
         ]);
 
+    // A failed/timed-out status is unusable — return None so the caller keeps
+    // the last good statuses instead of treating the repo as suddenly clean.
+    let out = run_capture(cmd, GIT_TIMEOUT)?;
     let mut statuses = HashMap::new();
-    if let Some(out) = run_capture(cmd, GIT_TIMEOUT) {
-        parse_porcelain_z(&out, &top, &mut statuses);
-    }
-
-    GitData {
+    parse_porcelain_z(&out, &top, &mut statuses);
+    Some(GitData {
         toplevel: Some(top),
         statuses,
-    }
+    })
 }
 
 /// Parse NUL-separated `git status --porcelain=v1 -z` output.
@@ -224,6 +233,10 @@ mod tests {
 
     #[test]
     fn priority_order() {
+        // Conflict outranks everything: a conflicted file under a directory
+        // full of staged changes must still surface the conflict glyph.
+        assert!(GitStatus::Conflict > GitStatus::Staged);
+        assert!(GitStatus::Conflict > GitStatus::Dirty);
         assert!(GitStatus::Staged > GitStatus::Dirty);
         assert!(GitStatus::Dirty > GitStatus::Untracked);
         assert!(GitStatus::Untracked > GitStatus::Ignored);
@@ -271,7 +284,7 @@ mod tests {
         git(&["add", ".gitignore", "tracked.txt"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
 
-        let data = scan(&dir);
+        let data = scan(&dir).expect("status of a real repo succeeds");
         // The ignored directory itself is tagged (not just its children).
         assert_eq!(
             data.statuses.get(&dir.join("node_modules")),

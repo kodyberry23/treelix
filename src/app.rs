@@ -428,6 +428,13 @@ impl App {
     }
 
     fn on_live_key(&mut self, key: KeyEvent) {
+        // Ctrl-C quits from the filter as it does everywhere else; without this
+        // the Char('c') arm below would type a literal 'c' into the query and
+        // the app could never be quit while editing a filter.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.clear_live_filter();
@@ -442,7 +449,13 @@ impl App {
                 }
                 self.on_live_query_changed();
             }
-            KeyCode::Char(c) => {
+            // Only unmodified characters extend the query; a Ctrl/Alt chord
+            // must not land its base letter in the filter text.
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 if let Some(q) = &mut self.live_filter {
                     q.push(c);
                 }
@@ -1350,8 +1363,12 @@ impl App {
         let root = self.tree.root.path.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let data = git::scan(&root);
-            let _ = tx.send(AppEvent::Git(data));
+            // Only forward a successful scan. A failed/timed-out status
+            // returns None; forwarding an empty result would blank every glyph
+            // and, under the git-clean filter, empty the tree.
+            if let Some(data) = git::scan(&root) {
+                let _ = tx.send(AppEvent::Git(data));
+            }
         });
     }
 
