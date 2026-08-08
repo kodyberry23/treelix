@@ -33,7 +33,7 @@ use crate::render::{self, Decor, RenderOpts};
 use crate::theme::Theme;
 use crate::tree::{Row, SortMode, Tree, ViewOptions};
 use crate::ui_overlays::{
-    self, ConfirmKind, ConfirmState, InfoState, InputKind, InputState, Overlay,
+    self, ConfirmKind, ConfirmState, HelpState, InfoState, InputKind, InputState, Overlay,
 };
 use crate::{ipc, watcher};
 
@@ -423,9 +423,9 @@ impl App {
                 self.overlay = Overlay::None;
                 return;
             }
-            Overlay::Help => {
+            Overlay::Help(_) => {
                 self.touch();
-                self.overlay = Overlay::None;
+                self.on_help_key(key);
                 return;
             }
             Overlay::None => {}
@@ -444,6 +444,45 @@ impl App {
         self.pending = pending;
         if action != Action::None {
             self.dispatch(action);
+        }
+    }
+
+    fn on_help_key(&mut self, key: KeyEvent) {
+        // Mirror render_help's geometry: it draws over the FULL pane (list area
+        // + the 1-row header above and 1-row status below), insets the body by
+        // pad_left+1 = 3 columns, and reserves 3 rows (1 top, 2 bottom). The
+        // full pane height is list_area.height + 2, so the body height is
+        // (list_area.height + 2) - 3 = list_area.height - 1.
+        let body_w = (self.list_area.width as usize).saturating_sub(3).max(1);
+        let body_h = self.list_area.height.saturating_sub(1);
+        let total = ui_overlays::help_line_count(body_w);
+        let max_scroll = total.saturating_sub(body_h);
+        let page = body_h.max(1);
+        let Overlay::Help(state) = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            // Dismiss.
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                state.scroll = (state.scroll + 1).min(max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.scroll = state.scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => {
+                state.scroll = (state.scroll + page).min(max_scroll);
+            }
+            KeyCode::Char('u') | KeyCode::PageUp => {
+                state.scroll = state.scroll.saturating_sub(page);
+            }
+            KeyCode::Char('g') | KeyCode::Home => state.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => state.scroll = max_scroll,
+            // Any other key closes, preserving the old "any key dismisses" feel
+            // for keys that aren't scroll controls.
+            _ => self.overlay = Overlay::None,
         }
     }
 
@@ -572,7 +611,7 @@ impl App {
                 self.reload_from_disk();
                 self.set_status("refreshed");
             }
-            Action::Help => self.overlay = Overlay::Help,
+            Action::Help => self.overlay = Overlay::Help(HelpState::default()),
             Action::ToggleSelect => self.toggle_select(),
             Action::ClearSelect => {
                 // Esc clears, in priority: an active live filter, then a visual
@@ -1941,7 +1980,9 @@ impl App {
                     ui_overlays::render_confirm(frame, area, &self.theme, state)
                 }
                 Overlay::Info(state) => ui_overlays::render_info(frame, area, &self.theme, state),
-                Overlay::Help => ui_overlays::render_help(frame, area, &self.theme),
+                Overlay::Help(state) => {
+                    ui_overlays::render_help(frame, area, &self.theme, state)
+                }
                 Overlay::None => {}
             }
         })?;
@@ -2164,6 +2205,49 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn help_scrolls_and_only_non_scroll_keys_dismiss() {
+        let (mut app, _root, _deep) = app_with_tree();
+        // Give the help a small viewport so its content is scrollable.
+        app.list_area = ratatui::layout::Rect::new(0, 1, 30, 6);
+        app.dispatch(Action::Help);
+        assert!(matches!(app.overlay, Overlay::Help(_)), "help opened");
+
+        // j scrolls down without dismissing.
+        app.on_key(key(KeyCode::Char('j')));
+        let s1 = match &app.overlay {
+            Overlay::Help(h) => h.scroll,
+            _ => panic!("j must not dismiss help"),
+        };
+        assert!(s1 >= 1, "j scrolled down");
+        // k scrolls back up.
+        app.on_key(key(KeyCode::Char('k')));
+        match &app.overlay {
+            Overlay::Help(h) => assert_eq!(h.scroll, s1 - 1),
+            _ => panic!("k must not dismiss help"),
+        }
+        // G jumps to the bottom; g back to the top.
+        app.on_key(key(KeyCode::Char('G')));
+        let bottom = match &app.overlay {
+            Overlay::Help(h) => h.scroll,
+            _ => panic!("G must not dismiss"),
+        };
+        assert!(bottom >= 1, "G scrolled to a positive max");
+        app.on_key(key(KeyCode::Char('g')));
+        match &app.overlay {
+            Overlay::Help(h) => assert_eq!(h.scroll, 0, "g returned to top"),
+            _ => panic!("g must not dismiss"),
+        }
+        // q dismisses.
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(matches!(app.overlay, Overlay::None), "q closes help");
+
+        // A non-scroll key (e.g. 'z') also dismisses (old any-key feel).
+        app.dispatch(Action::Help);
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(matches!(app.overlay, Overlay::None), "unrelated key closes help");
     }
 
     // Regression guard for f9744e4: set_status/clear_status must assign the

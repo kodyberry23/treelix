@@ -17,7 +17,15 @@ pub enum Overlay {
     Input(InputState),
     Confirm(ConfirmState),
     Info(InfoState),
-    Help,
+    Help(HelpState),
+}
+
+/// Scroll position of the help panel, so long binding lists are reachable on a
+/// narrow sidebar (where descriptions wrap to more rows than fit).
+#[derive(Debug, Clone, Default)]
+pub struct HelpState {
+    /// First visible content line (0-based), clamped to `max_scroll` at render.
+    pub scroll: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -321,13 +329,13 @@ pub fn render_info(frame: &mut Frame, area: Rect, theme: &Theme, state: &InfoSta
 /// Render the help panel listing the keybindings. Fills the entire pane
 /// (rather than floating) since the sidebar is typically narrow; any key
 /// dismisses it and restores the previous view.
-pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
+pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, state: &HelpState) {
     frame.render_widget(Clear, area);
     // Paint the whole pane with the help background first.
     frame.render_widget(Block::default().style(theme.help), area);
 
     // Inset the content: left/top padding so it isn't flush against the border,
-    // and reserve the bottom line for the "press any key" footer.
+    // and reserve the bottom line for the footer.
     let pad_left = 2u16;
     let inner_x = area.x + pad_left;
     let inner_w = area.width.saturating_sub(pad_left + 1);
@@ -344,22 +352,60 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         height: 1,
     };
 
+    let lines = help_lines(theme, body.width as usize);
+    let total = lines.len() as u16;
+    let visible = body.height;
+    // Clamp scroll so the last page is the furthest you can go.
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = state.scroll.min(max_scroll);
+
+    // Paragraph::scroll drops the first `scroll` lines; descriptions are already
+    // wrapped to fit, so no paragraph wrap.
+    let body_para = Paragraph::new(lines).style(theme.help).scroll((scroll, 0));
+    frame.render_widget(body_para, body);
+
+    // Footer doubles as a scroll indicator when the content overflows.
+    let footer_text = if max_scroll > 0 {
+        let more_below = scroll < max_scroll;
+        let more_above = scroll > 0;
+        match (more_above, more_below) {
+            (false, true) => "j/k scroll · more ↓ · q close".to_string(),
+            (true, true) => "j/k scroll · ↑↓ more · q close".to_string(),
+            (true, false) => "j/k scroll · more ↑ · q close".to_string(),
+            (false, false) => "q close".to_string(),
+        }
+    } else {
+        "press any key to close".to_string()
+    };
+    let footer_para = Paragraph::new(Line::from(Span::styled(
+        footer_text,
+        theme.indent_marker,
+    )))
+    .style(theme.help);
+    frame.render_widget(footer_para, footer);
+}
+
+/// The number of content lines the help panel would render at `body_width`
+/// (used to clamp scrolling in the key handler).
+pub fn help_line_count(body_width: usize) -> u16 {
+    // Cheap enough: this is only computed on a key press while help is open.
+    help_lines(&Theme::default(), body_width).len() as u16
+}
+
+/// Build the wrapped, two-column help content. A fixed-width key column on the
+/// left, descriptions wrapping within their own column on the right.
+fn help_lines(theme: &Theme, body_width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled("treelix — keybindings", theme.help_title)));
     lines.push(Line::from(""));
 
-    // Two-column layout: a fixed-width key column on the left and descriptions
-    // on the right that wrap *within their own column* instead of spilling back
-    // under the keybinding. We pre-wrap each description to the right column's
-    // width and print the key only on the first row (blank cell on the rest),
-    // so we don't rely on paragraph wrapping (which would reset to column 0).
     let key_col = HELP_ENTRIES
         .iter()
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(8)
         + 1; // one-space gutter between the columns
-    let desc_w = (body.width as usize).saturating_sub(key_col).max(1);
+    let desc_w = body_width.saturating_sub(key_col).max(1);
 
     for (key, desc) in HELP_ENTRIES {
         for (i, seg) in wrap_words(desc, desc_w).into_iter().enumerate() {
@@ -374,17 +420,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
             ]));
         }
     }
-
-    // Descriptions are already wrapped to fit, so render without paragraph wrap.
-    let body_para = Paragraph::new(lines).style(theme.help);
-    frame.render_widget(body_para, body);
-
-    let footer_para = Paragraph::new(Line::from(Span::styled(
-        "press any key to close",
-        theme.indent_marker,
-    )))
-    .style(theme.help);
-    frame.render_widget(footer_para, footer);
+    lines
 }
 
 /// Greedy word-wrap `text` into segments no wider than `width` columns. A word

@@ -71,7 +71,9 @@ treelix [--root <dir>] [--theme <name>]   # run the sidebar TUI (root: cwd)
 treelix reveal <path>                      # reveal a path in a running instance
 ```
 
-Press `?` (or `g?`) inside treelix for the keybinding help panel.
+Press `?` (or `g?`) inside treelix for the keybinding help panel. Scroll it with
+`j`/`k` (or the arrows), `d`/`u` for a page, `g`/`G` for top/bottom; `q` or `Esc`
+closes it.
 
 ### Keybindings (nvim-tree defaults)
 

@@ -43,11 +43,18 @@ fn build_line<'a>(row: &Row, theme: &Theme, opts: &RenderOpts, decor: &Decor) ->
         if !prefix.is_empty() {
             spans.push(Span::styled(prefix, theme.indent_marker));
         }
-        if opts.show_arrows && expandable {
-            spans.push(Span::styled(
-                format!("{} ", arrow_glyph(row, opts.icons_enabled)),
-                theme.arrow,
-            ));
+        if opts.show_arrows {
+            if expandable {
+                spans.push(Span::styled(
+                    format!("{} ", arrow_glyph(row, opts.icons_enabled)),
+                    theme.arrow,
+                ));
+            } else {
+                // Blank chevron cell so files and empty dirs stay aligned with
+                // their chevroned sibling directories (matches the nvim-tree
+                // branch below); without it they sit two columns to the left.
+                spans.push(Span::raw("  "));
+            }
         }
     } else {
         // nvim-tree style: plain whitespace indentation for ancestor levels,

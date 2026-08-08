@@ -177,26 +177,69 @@ fn parse_style(spec: &str, palette: &HashMap<String, Color>) -> Option<Style> {
     Some(style)
 }
 
-/// Resolve a color token: palette name, `#hex`, or `none`/empty → no color.
+/// Resolve a color token: palette name, `#hex`, a named ANSI color, or
+/// `none`/`default`/empty → no color.
 fn resolve_color(token: &str, palette: &HashMap<String, Color>) -> Option<Color> {
     let token = token.trim();
-    if token.is_empty() || token.eq_ignore_ascii_case("none") {
+    if token.is_empty()
+        || token.eq_ignore_ascii_case("none")
+        || token.eq_ignore_ascii_case("default")
+    {
         return None;
     }
     if let Some(c) = palette.get(token) {
         return Some(*c);
     }
+    // Named ANSI colors before hex — Helix themes like base16_terminal use
+    // `light-blue`, `light-green`, etc.; without this they silently fell back
+    // to the built-in theme for every scope that used one.
+    if let Some(c) = named_color(token) {
+        return Some(c);
+    }
     parse_hex(token)
 }
 
+/// Map Helix's named color set to a ratatui color. Accepts the eight base
+/// ANSI names, their `light-` variants, `gray`/`grey`, and `white`.
+fn named_color(token: &str) -> Option<Color> {
+    let t = token.trim().to_lowercase().replace('_', "-");
+    Some(match t.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" | "purple" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::DarkGray,
+        "white" => Color::White,
+        "light-red" => Color::LightRed,
+        "light-green" => Color::LightGreen,
+        "light-yellow" => Color::LightYellow,
+        "light-blue" => Color::LightBlue,
+        "light-magenta" | "light-purple" => Color::LightMagenta,
+        "light-cyan" => Color::LightCyan,
+        "light-gray" | "light-grey" => Color::Gray,
+        _ => return None,
+    })
+}
+
+/// Parse `#rrggbb` or `#rgb` (the latter expanded by doubling each nibble).
 fn parse_hex(s: &str) -> Option<Color> {
     let s = s.trim().trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    let (r, g, b) = match s.len() {
+        6 => (
+            u8::from_str_radix(&s[0..2], 16).ok()?,
+            u8::from_str_radix(&s[2..4], 16).ok()?,
+            u8::from_str_radix(&s[4..6], 16).ok()?,
+        ),
+        3 => {
+            let nib = |i: usize| u8::from_str_radix(&s[i..i + 1], 16).ok();
+            let (r, g, b) = (nib(0)?, nib(1)?, nib(2)?);
+            (r * 17, g * 17, b * 17) // 0xA -> 0xAA
+        }
+        _ => return None,
+    };
     Some(Color::Rgb(r, g, b))
 }
 
@@ -383,6 +426,27 @@ mod tests {
     #[test]
     fn hex_parsing() {
         assert_eq!(parse_hex("#1A1F28"), Some(Color::Rgb(0x1A, 0x1F, 0x28)));
-        assert_eq!(parse_hex("bad"), None);
+        assert_eq!(parse_hex("zqx"), None); // non-hex letters
+        assert_eq!(parse_hex("nothex"), None); // 6 chars, not all hex
+        // 3-digit hex expands by doubling each nibble.
+        assert_eq!(parse_hex("#abc"), Some(Color::Rgb(0xAA, 0xBB, 0xCC)));
+        assert_eq!(parse_hex("#f00"), Some(Color::Rgb(0xFF, 0x00, 0x00)));
+    }
+
+    #[test]
+    fn named_ansi_colors_resolve() {
+        let empty = HashMap::new();
+        assert_eq!(resolve_color("light-blue", &empty), Some(Color::LightBlue));
+        assert_eq!(resolve_color("light-green", &empty), Some(Color::LightGreen));
+        assert_eq!(resolve_color("red", &empty), Some(Color::Red));
+        assert_eq!(resolve_color("gray", &empty), Some(Color::DarkGray));
+        assert_eq!(resolve_color("light-gray", &empty), Some(Color::Gray));
+        // `default` and `none` mean "no color", not a fallback miss.
+        assert_eq!(resolve_color("default", &empty), None);
+        assert_eq!(resolve_color("none", &empty), None);
+        // A palette entry still wins over a like-named ANSI color.
+        let mut pal = HashMap::new();
+        pal.insert("red".to_string(), Color::Rgb(1, 2, 3));
+        assert_eq!(resolve_color("red", &pal), Some(Color::Rgb(1, 2, 3)));
     }
 }
