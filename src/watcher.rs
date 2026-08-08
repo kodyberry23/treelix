@@ -14,12 +14,16 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, RecvTimeoutError, Sender};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 const DEBOUNCE: Duration = Duration::from_millis(75);
+/// Hard cap on how long a single burst may accumulate before it is flushed,
+/// even if events keep arriving faster than `DEBOUNCE`. Bounds both delivery
+/// latency and the size of the accumulated path set under a continuous writer.
+const MAX_BURST: Duration = Duration::from_millis(500);
 
 /// Directories whose internal churn we don't want to react to.
 const IGNORE_COMPONENTS: &[&str] = &[
@@ -88,20 +92,35 @@ pub fn watch(root: PathBuf, sender: Sender<FsChange>) -> Option<RecommendedWatch
     thread::spawn(move || {
         // Block for the first event of each burst.
         while let Ok(first) = raw_rx.recv() {
+            let burst_start = Instant::now();
             let mut changed: HashSet<PathBuf> = HashSet::new();
             let mut rescan = false;
             match first {
                 RawEvent::Paths(paths) => changed.extend(paths),
                 RawEvent::Rescan => rescan = true,
             }
-            // Drain until things go quiet. A rescan anywhere in the burst
-            // upgrades the whole burst: the accumulated paths are incomplete
-            // by definition, so the consumer must do a full re-scan.
+            // Drain until things go quiet (DEBOUNCE with no event) OR the burst
+            // has run for MAX_BURST — whichever comes first. Without the burst
+            // cap a writer touching the tree faster than DEBOUNCE (a dev server
+            // writing into .next/dist every ~20ms) would never let the loop go
+            // quiet, so no FsChange would ever be sent and `changed` would grow
+            // without bound. A rescan anywhere upgrades the whole burst.
             loop {
-                match raw_rx.recv_timeout(DEBOUNCE) {
+                let waited = burst_start.elapsed();
+                if waited >= MAX_BURST {
+                    break;
+                }
+                let wait = DEBOUNCE.min(MAX_BURST - waited);
+                match raw_rx.recv_timeout(wait) {
                     Ok(RawEvent::Paths(paths)) => changed.extend(paths),
                     Ok(RawEvent::Rescan) => rescan = true,
-                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Quiet for a full DEBOUNCE — but if we only stopped
+                        // because the burst cap trimmed the wait, keep draining.
+                        if wait >= DEBOUNCE {
+                            break;
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }

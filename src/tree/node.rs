@@ -80,6 +80,17 @@ impl Node {
         self.name.starts_with('.')
     }
 
+    /// Find a descendant (or self) node by absolute path.
+    pub fn find(&self, target: &Path) -> Option<&Node> {
+        if self.path == target {
+            return Some(self);
+        }
+        if !target.starts_with(&self.path) {
+            return None;
+        }
+        self.children.iter().find_map(|c| c.find(target))
+    }
+
     /// Find a descendant (or self) node by absolute path, mutably.
     pub fn find_mut(&mut self, target: &Path) -> Option<&mut Node> {
         if self.path == target {

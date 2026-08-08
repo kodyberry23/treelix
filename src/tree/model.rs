@@ -143,16 +143,17 @@ impl Tree {
     pub fn expand(&mut self, path: &Path) {
         self.do_expand(path);
         // Group-empty: chain-expand through sole-child directories so the whole
-        // chain renders as one line.
+        // chain renders as one line. This MUST follow the sole VISIBLE child
+        // (honoring show_hidden / show_ignored), exactly as group_chain does at
+        // render time — following the sole RAW child instead would either stop
+        // early (a hidden sibling makes raw count > 1, leaving the visible sole
+        // child unloaded and rendering as an empty expanded row) or descend
+        // into an ignored node_modules the view then hides (a needless 100k
+        // read).
         if self.group_empty {
             let mut cur = path.to_path_buf();
             loop {
-                let next = match self.root.find_mut(&cur) {
-                    Some(n) if n.is_dir() && n.children.len() == 1 && n.children[0].is_dir() => {
-                        Some(n.children[0].path.clone())
-                    }
-                    _ => None,
-                };
+                let next = self.sole_visible_child_dir(&cur);
                 match next {
                     Some(child) => {
                         self.do_expand(&child);
@@ -162,6 +163,44 @@ impl Tree {
                 }
             }
         }
+    }
+
+    /// The path of `dir`'s only visible child when that child is a directory
+    /// and it is the sole visible entry — the structural test group_chain uses
+    /// to collapse a chain into one row. Visibility here is the persistent
+    /// toggles only (hidden dotfiles, git-ignored); the live-filter restricts
+    /// don't change the on-disk chain structure.
+    fn sole_visible_child_dir(&self, dir: &Path) -> Option<PathBuf> {
+        let node = self.root.find(dir)?;
+        if !node.is_dir() {
+            return None;
+        }
+        let mut visible = node.children.iter().filter(|c| self.chain_visible(c));
+        let first = visible.next()?;
+        // Never chain-descend into a high-churn directory (node_modules,
+        // target, ...). Its git-ignored status isn't applied yet at this point
+        // (children were just loaded), so the name is the only reliable signal;
+        // descending would read the whole tree the view immediately hides.
+        if visible.next().is_none()
+            && first.is_dir()
+            && !crate::watcher::is_high_churn_name(&first.name)
+        {
+            Some(first.path.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Structural visibility for chain-expansion: excludes hidden dotfiles
+    /// (unless show_hidden) and git-ignored entries (unless show_ignored).
+    fn chain_visible(&self, node: &Node) -> bool {
+        if !self.show_hidden && node.is_hidden() {
+            return false;
+        }
+        if !self.show_ignored && node.git == Some(GitStatus::Ignored) {
+            return false;
+        }
+        true
     }
 
     fn do_expand(&mut self, path: &Path) {
@@ -308,16 +347,26 @@ impl Tree {
         let mut merged = Vec::with_capacity(fresh.len());
         for f in fresh {
             match old.remove(&f.path) {
-                // Same path, still a directory: keep the existing node so its
-                // expansion state and loaded children survive; refresh metadata.
-                Some(mut existing) if existing.is_dir() && f.is_dir() => {
+                // Same path, SAME kind and (for symlinks) same target: keep the
+                // existing node so its expansion state and loaded children
+                // survive; refresh metadata. A real dir replaced by a
+                // symlink-to-dir, or a re-pointed symlink, both satisfy the old
+                // `is_dir() && is_dir()` test but must NOT keep the stale kind,
+                // arrow, or cached subtree — fall through to the fresh node.
+                Some(mut existing)
+                    if existing.is_dir()
+                        && f.is_dir()
+                        && existing.kind == f.kind
+                        && existing.link_to == f.link_to =>
+                {
                     existing.executable = f.executable;
                     existing.mtime = f.mtime;
                     existing.len = f.len;
                     merged.push(existing);
                 }
-                // New entry, removed-and-recreated as a different kind, or a file
-                // whose size/mtime we want refreshed: take the fresh node.
+                // New entry, kind/target changed, removed-and-recreated as a
+                // different kind, or a file whose size/mtime we want refreshed:
+                // take the fresh node (empty subtree, reloaded lazily).
                 _ => merged.push(f),
             }
         }
@@ -814,6 +863,57 @@ mod tests {
             rows.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
         assert!(rows.iter().any(|r| r.name == "file.txt"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn group_empty_chain_follows_visible_sole_child_past_hidden_sibling() {
+        // Regression: the chain-expand used RAW child count, so a hidden
+        // sibling (.DS_Store) beside the sole visible dir stopped the chain,
+        // leaving that dir unloaded — group_chain then followed the visible
+        // sole child at render time and produced an expanded row with NO
+        // contents, hiding the file underneath.
+        let d = tmpdir("group-hidden");
+        fs::create_dir_all(d.join("a/b")).unwrap();
+        fs::write(d.join("a/.DS_Store"), b"x").unwrap(); // hidden sibling of b
+        fs::write(d.join("a/b/file.txt"), b"y").unwrap();
+        let mut tree = Tree::new(d.clone());
+        tree.group_empty = true;
+        tree.expand(&d.join("a"));
+        let opts = ViewOptions {
+            group_empty: true,
+            ..Default::default()
+        };
+        let rows = tree.flatten(&opts);
+        let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
+        assert!(
+            names.iter().any(|n| *n == "a/b"),
+            "a and its sole visible child b group into one row: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| *n == "file.txt"),
+            "the file under the grouped chain is reachable: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn group_empty_does_not_descend_into_high_churn_sole_child() {
+        // A dir whose only child is node_modules must NOT chain-expand into it
+        // (that read the whole ignored tree the view hides). The high-churn
+        // NAME is the signal — git-ignored status isn't applied to freshly
+        // loaded children at chain-expand time.
+        let d = tmpdir("group-churn");
+        fs::create_dir_all(d.join("pkg/node_modules/dep")).unwrap();
+        fs::write(d.join("pkg/node_modules/dep/index.js"), b"x").unwrap();
+        let mut tree = Tree::new(d.clone());
+        tree.group_empty = true;
+        tree.expand(&d.join("pkg"));
+        let nm = tree.root.find(&d.join("pkg/node_modules")).unwrap();
+        assert!(
+            !nm.loaded,
+            "high-churn sole child must not be chain-expanded/loaded"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 }
