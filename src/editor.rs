@@ -57,45 +57,74 @@ impl OpenMode {
 }
 
 /// Open `path` in Helix using the configured strategy.
+///
+/// Runs on a DETACHED thread: the dispatch shells out to zellij
+/// (`list-panes`/`focus-pane-id`) and the dotfiles script, any of which can
+/// block for an unbounded time if the zellij server is wedged. Doing that on
+/// the UI event loop would freeze the whole TUI with no way to quit, so we fire
+/// and forget — a failed open is a no-op, never a hang.
 pub fn open(path: &Path, mode: OpenMode, config: &Config) {
     let abs = absolutize(path);
-
-    // 1. Explicit user template: `open_command` with {mode}/{path}.
-    if let Some(tmpl) = &config.open_command {
-        let cmd = tmpl
-            .replace("{mode}", mode.name())
-            .replace("{path}", &abs.to_string_lossy());
-        let _ = Command::new("sh").arg("-c").arg(cmd).status();
-        return;
-    }
-
-    // 2. dotfiles dispatcher. An older script that predates hsplit support
-    // rejects it with a non-zero exit, in which case we fall through to the
-    // internal socket dispatch below — graceful under version skew.
-    if let Some(script) = dispatch_script() {
-        let status = Command::new(&script).arg(mode.name()).arg(&abs).status();
-        if matches!(status, Ok(s) if s.success()) {
+    let open_command = config.open_command.clone();
+    std::thread::spawn(move || {
+        // 1. Explicit user template: `open_command` with {mode}/{path}.
+        if let Some(tmpl) = &open_command {
+            // POSIX-single-quote the path before interpolating into `sh -c`.
+            // Without this, a filename like `a$(rm -rf ~).md` executes as a
+            // command substitution, and spaces/globs split into extra args.
+            // `{mode}` is a fixed keyword (open|vsplit|hsplit), so it needs no
+            // quoting; users must NOT hand-quote {path} in their template.
+            let cmd = tmpl
+                .replace("{mode}", mode.name())
+                .replace("{path}", &posix_quote(&abs));
+            let _ = Command::new("sh").arg("-c").arg(cmd).status();
             return;
         }
-    }
 
-    // 3. Internal dispatch.
-    internal_dispatch(&abs, mode);
+        // 2. dotfiles dispatcher. An older script that predates hsplit support
+        // rejects it with a non-zero exit, in which case we fall through to the
+        // internal socket dispatch below — graceful under version skew.
+        if let Some(script) = dispatch_script() {
+            let status = Command::new(&script).arg(mode.name()).arg(&abs).status();
+            if matches!(status, Ok(s) if s.success()) {
+                return;
+            }
+        }
+
+        // 3. Internal dispatch.
+        internal_dispatch(&abs, mode);
+    });
 }
 
-/// Open `path` with the system handler (`open` on macOS).
+/// Open `path` with the system handler (`open` on macOS). Detached: `open` can
+/// block (e.g. launching a cold application) and must not stall the UI thread.
 pub fn system_open(path: &Path) {
-    let _ = Command::new("open").arg(path).status();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = Command::new("open").arg(&path).status();
+    });
+}
+
+/// POSIX-single-quote an arbitrary path for safe interpolation into a `sh -c`
+/// string: wrap in single quotes and replace each embedded `'` with `'\''`.
+/// This keeps EVERY byte literal — no command substitution, globbing, or word
+/// splitting — for any filename.
+fn posix_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
 }
 
 /// Preview: send `:open <path>` to Helix over its socket WITHOUT shifting focus,
-/// so the cursor stays in treelix. No-op if no socket is available.
+/// so the cursor stays in treelix. No-op if no socket is available. Detached:
+/// a wedged helix that accepts the connection but never reads could otherwise
+/// block the write (and thus the UI thread) until the write timeout.
 pub fn preview(path: &Path) {
     let abs = absolutize(path);
-    if let Some(sock) = helix_socket_path().filter(|s| is_socket(s)) {
-        // Quote so paths with spaces parse as one argument on the helix side.
-        let _ = send_to_socket(&sock, &format!(":open {}", helix_quote(&abs)));
-    }
+    std::thread::spawn(move || {
+        if let Some(sock) = helix_socket_path().filter(|s| is_socket(s)) {
+            // Quote so paths with spaces parse as one argument on the helix side.
+            let _ = send_to_socket(&sock, &format!(":open {}", helix_quote(&abs)));
+        }
+    });
 }
 
 fn internal_dispatch(abs: &Path, mode: OpenMode) {
@@ -115,7 +144,11 @@ fn internal_dispatch(abs: &Path, mode: OpenMode) {
             return;
         }
     }
-    // Fallback: spawn a fresh helix pane (in zellij) or a bare `hx`.
+    // Fallback: under zellij, open the file in a fresh editor pane. Without
+    // zellij there is no separate pane to route to — spawning `hx` here would
+    // inherit treelix's own stdin/stdout and draw a second TUI over the file
+    // tree on the same terminal, leaving a scrambled screen when it exits. A
+    // sidebar has no business seizing the terminal, so that path is a no-op.
     if std::env::var_os("ZELLIJ").is_some() {
         let _ = Command::new("zellij")
             .args([
@@ -130,8 +163,6 @@ fn internal_dispatch(abs: &Path, mode: OpenMode) {
             .arg("hx")
             .arg(abs)
             .status();
-    } else {
-        let _ = Command::new("hx").arg(abs).status();
     }
 }
 
@@ -145,6 +176,10 @@ fn helix_quote(p: &Path) -> String {
 
 fn send_to_socket(sock: &Path, line: &str) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(sock)?;
+    // Bound the write: a helix that accepted the connection but stopped reading
+    // must not park this thread forever (these run detached, but a leaked
+    // blocked thread per open still accumulates).
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     stream.write_all(line.as_bytes())?;
     stream.flush()
 }
@@ -287,5 +322,25 @@ mod tests {
         assert_eq!(helix_quote(Path::new("/x/a''b.txt")), "'/x/a''''b.txt'");
         // A double quote inside a single-quoted token is literal, no escaping.
         assert_eq!(helix_quote(Path::new("/x/a\"b.txt")), "'/x/a\"b.txt'");
+    }
+
+    #[test]
+    fn posix_quote_neutralizes_shell_metacharacters() {
+        // Plain path unchanged inside single quotes.
+        assert_eq!(posix_quote(Path::new("/a/b.txt")), "'/a/b.txt'");
+        // Command substitution and separators are inert inside single quotes.
+        assert_eq!(
+            posix_quote(Path::new("/x/a$(rm -rf ~).md")),
+            "'/x/a$(rm -rf ~).md'"
+        );
+        assert_eq!(posix_quote(Path::new("/x/a;b.md")), "'/x/a;b.md'");
+        assert_eq!(posix_quote(Path::new("/x/a b*.md")), "'/x/a b*.md'");
+        // An embedded single quote closes, escapes a literal quote, reopens —
+        // the classic '\'' sequence — so the break-out attempt stays literal.
+        assert_eq!(posix_quote(Path::new("/x/a'b.md")), "'/x/a'\\''b.md'");
+        assert_eq!(
+            posix_quote(Path::new("/x/'; rm -rf ~ #.md")),
+            "'/x/'\\''; rm -rf ~ #.md'"
+        );
     }
 }

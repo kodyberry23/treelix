@@ -116,9 +116,17 @@ impl Tree {
             if node.is_dir() && !node.loaded {
                 // Stat BEFORE reading: a change racing the read then looks
                 // stale on the next expand instead of being missed.
-                node.loaded_mtime = dir_mtime(&node.path);
-                node.children = read_dir_sorted(&node.path);
-                node.loaded = true;
+                let mtime = dir_mtime(&node.path);
+                // A read failure (permission denied, transient EMFILE) must
+                // NOT mark the dir loaded-and-empty: that would freeze it as a
+                // phantom-empty directory for the session (the mtime gate sees
+                // ctime-only permission changes as Fresh and never retries).
+                // Leave it unloaded so the next expand tries again.
+                if let Some(children) = try_read_dir_sorted(&node.path) {
+                    node.children = children;
+                    node.loaded_mtime = mtime;
+                    node.loaded = true;
+                }
             }
         }
     }
@@ -526,11 +534,8 @@ fn dir_mtime(dir: &Path) -> Option<std::time::SystemTime> {
 }
 
 /// Read a directory and return children as nodes (dirs first, name-sorted).
-pub fn read_dir_sorted(dir: &Path) -> Vec<Node> {
-    try_read_dir_sorted(dir).unwrap_or_default()
-}
-
-/// Like [`read_dir_sorted`], but distinguishes "empty" from "unreadable".
+/// Returns `None` when the directory is unreadable, distinct from an empty
+/// `Some(vec![])` — the caller must not cache "unreadable" as "empty".
 fn try_read_dir_sorted(dir: &Path) -> Option<Vec<Node>> {
     let mut nodes = Vec::new();
     let entries = fs::read_dir(dir).ok()?;

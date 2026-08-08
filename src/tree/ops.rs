@@ -113,6 +113,25 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<()> {
 
 fn copy_inner(from: &Path, to: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
+    // Recreate a symlink as a symlink. fs::symlink_metadata does not follow
+    // links, so this branch is reached for a symlink whether it points at a
+    // file or a directory; fs::copy would instead FOLLOW it — materializing a
+    // full byte copy of the target (duplicating a symlinked 2GB asset) or
+    // failing with EISDIR for a link to a directory.
+    if meta.file_type().is_symlink() {
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let target = fs::read_link(from)?;
+        #[cfg(unix)]
+        {
+            return std::os::unix::fs::symlink(&target, to);
+        }
+        #[cfg(not(unix))]
+        {
+            return fs::copy(from, to).map(|_| ());
+        }
+    }
     if meta.is_dir() {
         fs::create_dir_all(to)?;
         // Snapshot the listing before recursing: a live read_dir handle can
@@ -223,6 +242,39 @@ mod tests {
         // A sibling destination still works.
         copy(&d.join("src"), &d.join("dst")).unwrap();
         assert!(d.join("dst/a.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_symlinks_instead_of_dereferencing() {
+        // Regression: fs::copy followed the link — duplicating the target's
+        // bytes for a file link, or failing EISDIR for a dir link. Copy must
+        // recreate the link itself.
+        let d = tmpdir("copy-symlink");
+        fs::create_dir(d.join("realdir")).unwrap();
+        fs::write(d.join("realdir/inner.txt"), b"data").unwrap();
+        fs::write(d.join("target.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink(d.join("target.txt"), d.join("link_file")).unwrap();
+        std::os::unix::fs::symlink(d.join("realdir"), d.join("link_dir")).unwrap();
+        // Copy a directory containing both kinds of symlink.
+        fs::create_dir(d.join("bundle")).unwrap();
+        fs::rename(d.join("link_file"), d.join("bundle/link_file")).unwrap();
+        fs::rename(d.join("link_dir"), d.join("bundle/link_dir")).unwrap();
+        copy(&d.join("bundle"), &d.join("bundle_copy")).unwrap();
+        // Both copied entries are still symlinks, not materialized copies.
+        assert!(fs::symlink_metadata(d.join("bundle_copy/link_file"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(d.join("bundle_copy/link_dir"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(d.join("bundle_copy/link_file")).unwrap(),
+            d.join("target.txt")
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

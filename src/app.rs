@@ -255,11 +255,19 @@ impl App {
 
         loop {
             self.draw(terminal)?;
-            // With a status message showing, wait only until its deadline so
-            // we can clear it even if no further event ever arrives; a passed
-            // deadline yields a zero wait -> immediate Timeout -> clear.
-            // Otherwise block until the next event.
-            let received = match self.status_deadline {
+            // Compute the next self-scheduled wake, if any. Two timers can fire
+            // with no incoming event:
+            //   - a transient status message that must auto-clear;
+            //   - a deferred follow-reveal that must be applied once the input
+            //     grace window lapses (otherwise it waits, possibly forever,
+            //     for an unrelated event and then applies out of order).
+            // Wake at whichever is sooner.
+            let wake = self
+                .status_deadline
+                .into_iter()
+                .chain(self.pending_reveal_deadline())
+                .min();
+            let received = match wake {
                 Some(deadline) => self
                     .rx
                     .recv_timeout(deadline.saturating_duration_since(Instant::now())),
@@ -267,7 +275,18 @@ impl App {
             };
             match received {
                 Ok(ev) => self.handle_event(ev),
-                Err(RecvTimeoutError::Timeout) => self.clear_status(),
+                Err(RecvTimeoutError::Timeout) => {
+                    // A timer fired. Clear an expired status, and flush a
+                    // now-eligible deferred reveal (grace window lapsed).
+                    if self.status_deadline.is_some_and(|d| Instant::now() >= d) {
+                        self.clear_status();
+                    }
+                    if self.pending_reveal.is_some() && !self.recent_input() {
+                        if let Some(path) = self.pending_reveal.take() {
+                            self.reveal(&path);
+                        }
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             if self.should_quit {
@@ -275,6 +294,20 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// When a deferred follow-reveal is pending, the instant its input grace
+    /// window lapses (so the run loop can wake and apply it without waiting on
+    /// an unrelated event). `None` when nothing is pending.
+    fn pending_reveal_deadline(&self) -> Option<Instant> {
+        self.pending_reveal.as_ref()?;
+        // Wake just past the grace window measured from the last acting input;
+        // if no input was recorded, the reveal is already eligible (wake now).
+        Some(
+            self.last_input
+                .map(|t| t + Self::FOLLOW_INPUT_GRACE)
+                .unwrap_or_else(Instant::now),
+        )
     }
 
     fn handle_event(&mut self, ev: AppEvent) {
@@ -308,6 +341,10 @@ impl App {
                 self.refresh_rows(self.selected_path());
             }
             AppEvent::Reveal(ipc::Reveal { path, follow }) => {
+                // Bring the incoming path into the tree's canonical namespace
+                // so the highlight (current_file compared against row.path) and
+                // the reveal below both match nodes keyed by canonical paths.
+                let path = canonicalize_lenient(&path);
                 // Helix told us its current buffer: mark it and highlight
                 // (the highlight is styling derived from `current_file`, so
                 // the regular post-event redraw picks it up — no row rebuild
@@ -330,13 +367,15 @@ impl App {
         }
     }
 
+    /// How long after an acting input a follow-reveal stays deferred.
+    const FOLLOW_INPUT_GRACE: Duration = Duration::from_millis(1000);
+
     /// True while the user is actively driving treelix (last acted-on input
     /// within the grace window). Follow-reveals are deferred during this
     /// window; explicit reveals ignore it.
     fn recent_input(&self) -> bool {
-        const FOLLOW_INPUT_GRACE: Duration = Duration::from_millis(1000);
         self.last_input
-            .is_some_and(|t| t.elapsed() < FOLLOW_INPUT_GRACE)
+            .is_some_and(|t| t.elapsed() < Self::FOLLOW_INPUT_GRACE)
     }
 
     /// Record that the user just acted on the tree (gates follow-reveals).
@@ -1238,10 +1277,23 @@ impl App {
     // ── Reveal / reload ─────────────────────────────────────────────────────
 
     fn reveal(&mut self, path: &Path) {
-        if self.tree.reveal(path) {
-            self.tree.apply_git(&self.git);
-            self.refresh_rows(None);
-            self.select_path(path);
+        // The tree root is canonicalized (main.rs), but reveal paths arrive
+        // raw from the socket / CLI and may traverse a symlink (/tmp ->
+        // /private/tmp on macOS, ~/work -> /Volumes/...). Compare in the same
+        // namespace or every such reveal silently misses. Lenient: a follow
+        // push can name a not-yet-saved buffer, so resolve the existing prefix
+        // and keep the tail.
+        let path = canonicalize_lenient(path);
+        // Tree::reveal expands the ancestor chain regardless of whether the
+        // leaf exists yet, so the row set must be rebuilt either way — skipping
+        // the refresh leaves rows whose `expanded` flag contradicts the model
+        // (the next toggle then inverts). The return value only decides whether
+        // the cursor can move onto the revealed row.
+        let landed = self.tree.reveal(&path);
+        self.tree.apply_git(&self.git);
+        self.refresh_rows(None);
+        if landed {
+            self.select_path(&path);
         }
     }
 
@@ -1910,6 +1962,24 @@ fn human_ago(t: SystemTime) -> String {
     }
 }
 
+/// Canonicalize a path whose leaf may not exist yet: resolve the deepest
+/// existing ancestor (following symlinks) and re-attach the remaining
+/// components. Used to bring incoming reveal paths into the same namespace as
+/// the canonicalized tree root. Falls back to the input if nothing resolves.
+fn canonicalize_lenient(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    for anc in p.ancestors().skip(1) {
+        if let Ok(real) = std::fs::canonicalize(anc) {
+            if let Ok(rest) = p.strip_prefix(anc) {
+                return real.join(rest);
+            }
+        }
+    }
+    p.to_path_buf()
+}
+
 /// Lexically resolve `.` and `..` components (no filesystem access), so a
 /// user-typed relative path can be containment-checked against the tree root
 /// before anything touches the disk.
@@ -1948,10 +2018,12 @@ mod tests {
     ///   root/
     ///     sub/deep.txt   (sub collapsed at startup -> deep.txt not in `rows`)
     ///     a.txt
-    /// Tree::new does not canonicalize, so paths derived from the same root
-    /// match its nodes (no macOS /private mismatch). Returns (app, root, deep).
+    /// The root is canonicalized exactly as main.rs does at startup, so paths
+    /// derived from it are in the same namespace as the tree nodes AND as the
+    /// canonicalize_lenient() applied to reveal paths (on macOS /tmp and
+    /// std::env::temp_dir() resolve under /private). Returns (app, root, deep).
     fn app_with_tree() -> (App, PathBuf, PathBuf) {
-        let root = unique_tmpdir();
+        let root = fs::canonicalize(unique_tmpdir()).unwrap();
         fs::create_dir(root.join("sub")).unwrap();
         fs::write(root.join("sub/deep.txt"), b"x").unwrap();
         fs::write(root.join("a.txt"), b"x").unwrap();

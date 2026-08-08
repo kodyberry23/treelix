@@ -12,7 +12,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use crossbeam_channel::Sender;
@@ -40,15 +40,36 @@ pub fn socket_path() -> PathBuf {
         .join(format!("{}.sock", editor::session_name()))
 }
 
-/// Removes the socket file when dropped.
+/// Removes the socket file when dropped — but only if it is still the SAME
+/// socket this instance bound. Another instance that later rebound the path
+/// (after a restart race) must not have its live socket unlinked out from under
+/// it, which would leave the real sidebar dark with no error anywhere.
 pub struct SocketGuard {
     path: PathBuf,
+    /// (dev, ino) of the socket file this guard created; the drop compares
+    /// against the path's current identity before unlinking.
+    identity: Option<(u64, u64)>,
 }
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if socket_identity(&self.path) == self.identity {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+#[cfg(unix)]
+fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn socket_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Bind the reveal socket and serve in a background thread. Each parsed
@@ -85,17 +106,26 @@ pub fn serve(sender: Sender<Reveal>) -> Option<SocketGuard> {
         }
     };
 
+    let identity = socket_identity(&path);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            handle(stream, &sender);
+            // Handle each connection on its own thread. A single client that
+            // connects and holds the socket open (a stray `nc -U`, or a helix
+            // sender whose process is paused mid-write) must not park the
+            // accept loop and freeze every subsequent reveal.
+            let sender = sender.clone();
+            thread::spawn(move || handle(stream, &sender));
         }
     });
 
-    Some(SocketGuard { path })
+    Some(SocketGuard { path, identity })
 }
 
 fn handle(stream: UnixStream, sender: &Sender<Reveal>) {
+    // Bound the read so a peer that connects and then stalls (never sending a
+    // newline, never closing) frees this thread instead of leaking it.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let reader = BufReader::new(stream);
     for line in reader.lines().map_while(Result::ok) {
         if let Some(reveal) = parse_line(&line) {
@@ -125,6 +155,15 @@ fn parse_line(line: &str) -> Option<Reveal> {
 /// Exits non-zero (after printing to stderr) when no instance is listening,
 /// mirroring broot's `--send` behavior.
 pub fn send_reveal(path: &str) -> std::io::Result<()> {
+    // The protocol is newline-delimited; a newline in the path would smuggle a
+    // second command onto the wire. Reject rather than corrupt the stream
+    // (mirrors helix's sender guard in sidebar_follow.rs).
+    if path.contains('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reveal path contains a newline",
+        ));
+    }
     let sock = socket_path();
     let mut stream = UnixStream::connect(&sock).map_err(|e| {
         eprintln!(

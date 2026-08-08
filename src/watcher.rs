@@ -53,6 +53,7 @@ enum RawEvent {
 pub fn watch(root: PathBuf, sender: Sender<FsChange>) -> Option<RecommendedWatcher> {
     let (raw_tx, raw_rx) = unbounded::<RawEvent>();
 
+    let cb_root = root.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
             // An overflow/rescan event's paths are not a complete description
@@ -65,16 +66,14 @@ pub fn watch(root: PathBuf, sender: Sender<FsChange>) -> Option<RecommendedWatch
             // duration of the install.
             if event.need_rescan() {
                 let confined_to_ignored = !event.paths.is_empty()
-                    && event.paths.iter().all(|p| {
-                        p.components().any(|c| is_high_churn_os(c.as_os_str()))
-                    });
+                    && event.paths.iter().all(|p| inside_ignored(&cb_root, p));
                 if !confined_to_ignored {
                     let _ = raw_tx.send(RawEvent::Rescan);
                 }
                 return;
             }
             // Drop events confined entirely to high-churn ignored directories.
-            if !event.paths.is_empty() && event.paths.iter().all(|p| is_ignored(p)) {
+            if !event.paths.is_empty() && event.paths.iter().all(|p| is_ignored(&cb_root, p)) {
                 return;
             }
             let _ = raw_tx.send(RawEvent::Paths(event.paths));
@@ -120,15 +119,34 @@ pub fn watch(root: PathBuf, sender: Sender<FsChange>) -> Option<RecommendedWatch
     Some(watcher)
 }
 
-/// True when `path` lies strictly INSIDE an ignored directory. An event whose
-/// final component IS the ignored directory (its creation, deletion, or
-/// rename) must pass through — dropping it would leave the parent listing
-/// stale, hiding a new `build/` or showing a deleted `node_modules/` forever.
-/// Only the churn within such directories is noise.
-fn is_ignored(path: &Path) -> bool {
-    let mut comps = path.components();
+/// True when `path` lies strictly INSIDE an ignored directory that is itself
+/// BELOW the watch root. An event whose final component IS the ignored
+/// directory (its creation, deletion, or rename) must pass through — dropping
+/// it would leave the parent listing stale, hiding a new `build/` or showing a
+/// deleted `node_modules/` forever. Only the churn within such directories is
+/// noise.
+///
+/// The root prefix is stripped first: components ABOVE the root (a project that
+/// happens to live under a directory literally named `build` or `target`) must
+/// never mark paths as ignored — that would silently drop every event and
+/// freeze the whole tree.
+fn is_ignored(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false; // outside the tree: not our concern, don't drop it
+    };
+    let mut comps = rel.components();
     comps.next_back(); // the entry itself may BE the ignored dir — keep those
     comps.any(|c| is_high_churn_os(c.as_os_str()))
+}
+
+/// Whether `path` is inside a high-churn ignored directory below the root,
+/// counting the final component too (used for the rescan-confinement check,
+/// where a rescan scoped to `node_modules/` itself is still ignorable churn).
+fn inside_ignored(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    rel.components().any(|c| is_high_churn_os(c.as_os_str()))
 }
 
 fn is_high_churn_os(s: &std::ffi::OsStr) -> bool {
@@ -149,18 +167,40 @@ mod tests {
 
     #[test]
     fn ignores_only_paths_inside_ignored_dirs() {
+        let r = Path::new("/r");
         // Interior churn is dropped...
-        assert!(is_ignored(Path::new("/r/node_modules/pkg")));
-        assert!(is_ignored(Path::new("/r/node_modules/pkg/index.js")));
-        assert!(is_ignored(Path::new("/r/a/target/debug/bin")));
+        assert!(is_ignored(r, Path::new("/r/node_modules/pkg")));
+        assert!(is_ignored(r, Path::new("/r/node_modules/pkg/index.js")));
+        assert!(is_ignored(r, Path::new("/r/a/target/debug/bin")));
         // ...but the ignored directory's own lifecycle events pass through,
         // so its parent listing stays truthful.
-        assert!(!is_ignored(Path::new("/r/node_modules")));
-        assert!(!is_ignored(Path::new("/r/a/target")));
-        assert!(!is_ignored(Path::new("/r/build")));
+        assert!(!is_ignored(r, Path::new("/r/node_modules")));
+        assert!(!is_ignored(r, Path::new("/r/a/target")));
+        assert!(!is_ignored(r, Path::new("/r/build")));
         // Ordinary paths are never dropped.
-        assert!(!is_ignored(Path::new("/r/src/main.rs")));
+        assert!(!is_ignored(r, Path::new("/r/src/main.rs")));
         // A FILE named like an ignored dir is the final component — kept.
-        assert!(!is_ignored(Path::new("/r/src/build")));
+        assert!(!is_ignored(r, Path::new("/r/src/build")));
+    }
+
+    #[test]
+    fn root_prefix_components_are_not_treated_as_ignored() {
+        // Regression: the whole absolute path was scanned, so a project living
+        // under a directory literally named `build`/`target`/`node_modules`
+        // matched on every event and silently froze the entire watcher.
+        let root = Path::new("/Users/kody/build/app");
+        assert!(
+            !is_ignored(root, Path::new("/Users/kody/build/app/src/main.rs")),
+            "the `build` ABOVE the root must not mark paths ignored"
+        );
+        assert!(
+            !inside_ignored(root, Path::new("/Users/kody/build/app/src/main.rs")),
+            "rescan confinement must also ignore the root prefix"
+        );
+        // A real node_modules BELOW this awkward root is still ignored.
+        assert!(is_ignored(
+            root,
+            Path::new("/Users/kody/build/app/node_modules/x/i.js")
+        ));
     }
 }
