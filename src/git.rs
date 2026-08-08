@@ -208,10 +208,33 @@ fn parse_porcelain_z(buf: &[u8], top: &Path, out: &mut HashMap<PathBuf, GitStatu
             let _ = fields.next();
         }
 
-        let rel = String::from_utf8_lossy(path_bytes);
-        let rel = rel.trim_end_matches('/');
+        // Build the path from the RAW bytes: `entry.path()` in the tree
+        // preserves them verbatim, so a lossy UTF-8 conversion here would
+        // produce a key (with U+FFFD) that never matches a non-UTF-8 filename's
+        // node — that file would then never show a git glyph, and an ignored
+        // one would never be pruned.
+        let rel = rel_bytes_to_path(trim_trailing_slash(path_bytes));
         out.insert(top.join(rel), status);
     }
+}
+
+/// Drop a single trailing `/` byte (git tags directories `dir/`).
+fn trim_trailing_slash(bytes: &[u8]) -> &[u8] {
+    match bytes.split_last() {
+        Some((b'/', rest)) => rest,
+        _ => bytes,
+    }
+}
+
+#[cfg(unix)]
+fn rel_bytes_to_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn rel_bytes_to_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -257,6 +280,28 @@ mod tests {
             map.get(Path::new("/repo/new.rs")),
             Some(&GitStatus::Untracked)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_preserves_non_utf8_path_bytes() {
+        // A Latin-1 filename (café.txt as caf\xe9.txt) must key on its raw
+        // bytes so the status matches the node built from entry.path(); a lossy
+        // conversion would insert U+FFFD and never match.
+        use std::os::unix::ffi::OsStrExt;
+        let top = Path::new("/repo");
+        let mut map = HashMap::new();
+        let mut buf = b" M caf".to_vec();
+        buf.push(0xe9);
+        buf.extend_from_slice(b".txt\0");
+        parse_porcelain_z(&buf, top, &mut map);
+        let mut name = b"caf".to_vec();
+        name.push(0xe9);
+        name.extend_from_slice(b".txt");
+        let expected = top.join(std::ffi::OsStr::from_bytes(&name));
+        assert_eq!(map.get(&expected), Some(&GitStatus::Dirty));
+        // And it is NOT stored under the lossy key.
+        assert!(!map.contains_key(Path::new("/repo/caf\u{FFFD}.txt")));
     }
 
     #[test]

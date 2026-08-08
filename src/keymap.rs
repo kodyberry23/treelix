@@ -104,6 +104,14 @@ pub fn resolve(key: KeyEvent, pending: &str) -> (Action, String) {
         return (action, none);
     }
 
+    // treelix has no Alt-chord bindings. Without this guard an Alt-modified key
+    // falls through to the plain match on its bare code — so Alt-d would fire
+    // Delete, Alt-v ToggleSelect, etc. SHIFT is NOT excluded: K/J/>/< are
+    // shift-letters that legitimately reach the match below.
+    if alt {
+        return (Action::None, none);
+    }
+
     match key.code {
         // Enter multi-key prefixes.
         KeyCode::Char('g') => (Action::None, "g".into()),
@@ -262,6 +270,19 @@ mod tests {
         // bmv is three keys.
         assert_eq!(resolve(key('m'), "b").1, "bm");
         assert_eq!(resolve(key('v'), "bm").0, Action::BulkMove);
+    }
+
+    #[test]
+    fn top_level_alt_chord_is_inert() {
+        // Regression: Alt-modified keys fell through to the plain match, so
+        // Alt-d fired Delete and Alt-v fired ToggleSelect. Alt is not a
+        // treelix modifier — it must resolve to nothing.
+        let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        assert_eq!(resolve(alt('d'), "").0, Action::None);
+        assert_eq!(resolve(alt('v'), "").0, Action::None);
+        assert_eq!(resolve(alt('q'), "").0, Action::None);
+        // A plain key still resolves.
+        assert_eq!(resolve(key('d'), "").0, Action::Delete);
     }
 
     #[test]
