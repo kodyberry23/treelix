@@ -1951,6 +1951,27 @@ mod tests {
     }
 
     #[test]
+    fn filter_hides_folders_without_matches() {
+        // Default behavior: a folder appears in the filtered view only if its
+        // own name matches or it is an ancestor of a match — unrelated folders
+        // (and folders with no matching files) are noise and stay hidden.
+        let (mut app, root, deep) = app_with_tree();
+        fs::create_dir(root.join("unrelated")).unwrap();
+        fs::write(root.join("unrelated/other.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan)); // pick up new dir
+        type_filter(&mut app, "deep");
+        assert!(deep_visible(&app, &deep), "match shown");
+        assert!(
+            app.rows.iter().any(|r| r.name == "sub"),
+            "ancestor of the match stays visible"
+        );
+        assert!(
+            !app.rows.iter().any(|r| r.name == "unrelated"),
+            "folder with no matches is hidden"
+        );
+    }
+
+    #[test]
     fn clearing_filter_restores_expansion_state() {
         let (mut app, _root, deep) = app_with_tree();
         type_filter(&mut app, "deep");

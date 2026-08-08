@@ -116,11 +116,13 @@ Selection-aware ops: when nodes are multi-selected with `v`, the delete / trash 
 cut / copy actions operate on the whole selection. Bulk `bd` / `bt` / `bmv` act on
 bookmarked nodes (`m`).
 
-Live filter (`f`): matches **files** by name while keeping folders visible so the
-tree stays navigable (nvim-tree's `always_show_folders`; set
-`live_filter_show_folders = false` to also hide non-matching folders). Like
-nvim-tree, it searches only nodes that are currently loaded — press `E`
-(expand-all) first to filter across the whole tree. `Esc` or `F` clears it.
+Live filter (`f`): matches entries by name across the whole tree on disk —
+collapsed and never-opened directories included — and auto-expands the folders
+on the path to each match so results are visible immediately. The filtered view
+shows only matches, folders whose names match, and the ancestors needed to
+reach them (set `live_filter_show_folders = true` for nvim-tree's
+`always_show_folders` behavior, where every folder stays visible). Clearing the
+filter (`Esc` or `F`) restores the expansion state from before it was armed.
 
 ## Configuration
 
@@ -139,7 +141,8 @@ files_first = false     # place files before directories
 group_empty = false     # collapse chains of sole-child dirs into one line
 mouse = true            # click to open/cd, scroll to move
 bookmarks_persist = false   # persist bookmarks to ~/.config/treelix/bookmarks
-live_filter_show_folders = true   # keep folders visible during `f` (filter files only)
+live_filter_show_folders = false  # true → every folder stays visible during `f`;
+                                  #   false → only matches + their ancestors
 exclude = []            # substring patterns hidden when custom filter (U) is on
 # special_files = ["cargo.toml", "makefile", "readme.md", ...]   # highlighted
 # open_command = "~/projects/helix-files/scripts/dispatch-to-editor.sh {mode} {path}"

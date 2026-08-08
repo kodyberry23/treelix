@@ -32,9 +32,11 @@ pub struct Config {
     pub mouse: bool,
     /// Persist bookmarks to `~/.config/treelix/bookmarks`.
     pub bookmarks_persist: bool,
-    /// Keep folders visible during a live filter (`f`), matching only files by
-    /// name — nvim-tree's `live_filter.always_show_folders`. Set false to also
-    /// hide non-matching folders.
+    /// Keep ALL folders visible during a live filter (`f`), even ones that
+    /// neither match nor contain a match — nvim-tree's
+    /// `live_filter.always_show_folders`. Off by default: the filtered view
+    /// shows only matching entries, folders whose names match, and the
+    /// ancestor folders needed to reach a match; everything else is noise.
     pub live_filter_show_folders: bool,
     /// Substring patterns hidden when the custom filter (`U`) is active.
     pub exclude: Vec<String>,
@@ -60,7 +62,7 @@ impl Default for Config {
             group_empty: false,
             mouse: true,
             bookmarks_persist: false,
-            live_filter_show_folders: true,
+            live_filter_show_folders: false,
             exclude: Vec::new(),
             special_files: default_special_files(),
             open_command: None,
