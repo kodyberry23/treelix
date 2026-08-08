@@ -279,20 +279,6 @@ impl Tree {
         }
     }
 
-    /// Collapse everything, then expand exactly the directories in `expanded`
-    /// (shallowest first, skipping ones that no longer exist). Used to put the
-    /// tree back the way it was after a live filter auto-expanded to matches.
-    pub fn restore_expanded(&mut self, expanded: &HashSet<PathBuf>) {
-        self.collapse_all();
-        let mut paths: Vec<&PathBuf> = expanded.iter().collect();
-        paths.sort_by_key(|p| p.components().count());
-        for p in paths {
-            if p.exists() {
-                self.do_expand(p);
-            }
-        }
-    }
-
     /// Re-scan a single loaded directory in place, preserving the expansion
     /// state and cached subtrees of children that still exist. Returns true if
     /// the directory was present and loaded (and thus refreshed).
