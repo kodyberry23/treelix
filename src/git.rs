@@ -323,11 +323,24 @@ mod tests {
         // reports the canonical toplevel, so status keys use the real path.
         let dir = std::fs::canonicalize(&dir).unwrap();
         let git = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
         };
         git(&["init", "-q"]);
         git(&["add", ".gitignore", "tracked.txt"]);
-        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
 
         let data = scan(&dir).expect("status of a real repo succeeds");
         // The ignored directory itself is tagged (not just its children).

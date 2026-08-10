@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -828,10 +828,7 @@ impl App {
         self.reload_from_disk();
         match first_err {
             None => self.set_status(format!("removed {total} item(s)")),
-            Some(e) => self.set_status(format!(
-                "removed {} of {total} ({e})",
-                removed.len()
-            )),
+            Some(e) => self.set_status(format!("removed {} of {total} ({e})", removed.len())),
         }
     }
 
@@ -1514,7 +1511,9 @@ impl App {
             if let Some(i) = self.rows.iter().position(|r| r.path == p) {
                 return Some(i);
             }
-            cur = p.parent().filter(|par| par.starts_with(&self.tree.root.path));
+            cur = p
+                .parent()
+                .filter(|par| par.starts_with(&self.tree.root.path));
         }
         None
     }
@@ -1592,7 +1591,11 @@ impl App {
                     continue;
                 }
                 if self.custom_active
-                    && self.config.exclude.iter().any(|p| name.contains(p.as_str()))
+                    && self
+                        .config
+                        .exclude
+                        .iter()
+                        .any(|p| name.contains(p.as_str()))
                 {
                     continue;
                 }
@@ -1601,7 +1604,9 @@ impl App {
                 // Match the tree's NodeKind semantics: a symlink to a directory
                 // is a directory for visibility and descent.
                 let is_link_dir = ft.is_some_and(|t| t.is_symlink())
-                    && std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+                    && std::fs::metadata(&path)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
                 let is_dir = is_plain_dir || is_link_dir;
                 let matched = pat.as_ref().is_none_or(|p| {
                     p.score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
@@ -1980,9 +1985,7 @@ impl App {
                     ui_overlays::render_confirm(frame, area, &self.theme, state)
                 }
                 Overlay::Info(state) => ui_overlays::render_info(frame, area, &self.theme, state),
-                Overlay::Help(state) => {
-                    ui_overlays::render_help(frame, area, &self.theme, state)
-                }
+                Overlay::Help(state) => ui_overlays::render_help(frame, area, &self.theme, state),
                 Overlay::None => {}
             }
         })?;
@@ -2173,8 +2176,8 @@ mod tests {
     fn unique_tmpdir() -> PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir()
-            .join(format!("treelix-apptest-{}-{}", std::process::id(), n));
+        let base =
+            std::env::temp_dir().join(format!("treelix-apptest-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         base
@@ -2247,7 +2250,10 @@ mod tests {
         // A non-scroll key (e.g. 'z') also dismisses (old any-key feel).
         app.dispatch(Action::Help);
         app.on_key(key(KeyCode::Char('z')));
-        assert!(matches!(app.overlay, Overlay::None), "unrelated key closes help");
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "unrelated key closes help"
+        );
     }
 
     // Regression guard for f9744e4: set_status/clear_status must assign the
@@ -2273,7 +2279,10 @@ mod tests {
             follow: false,
         }));
         assert_eq!(app.current_file.as_ref(), Some(&deep));
-        assert!(app.pending_reveal.is_none(), "explicit reveal is never deferred");
+        assert!(
+            app.pending_reveal.is_none(),
+            "explicit reveal is never deferred"
+        );
         assert!(deep_visible(&app, &deep), "sub expanded, deep revealed");
         assert_eq!(app.selected_path().as_ref(), Some(&deep));
     }
@@ -2380,7 +2389,10 @@ mod tests {
             !deep_visible(&app, &deep),
             "sub must be collapsed again after the filter is cleared"
         );
-        assert!(app.rows.iter().any(|r| r.name == "a.txt"), "full tree is back");
+        assert!(
+            app.rows.iter().any(|r| r.name == "a.txt"),
+            "full tree is back"
+        );
     }
 
     #[test]
@@ -2439,7 +2451,7 @@ mod tests {
         app.dispatch(Action::Expand);
         type_filter(&mut app, "deep");
         app.on_key(key(KeyCode::Enter)); // park
-        // User collapses `sub` while parked.
+                                         // User collapses `sub` while parked.
         app.select_path(&root.join("sub"));
         app.dispatch(Action::CollapseOrParent);
         assert!(!app.tree.collect_expanded().contains(&root.join("sub")));
@@ -2460,9 +2472,9 @@ mod tests {
         app.reveal(&deep);
         assert_eq!(app.selected_path().as_ref(), Some(&deep));
         type_filter(&mut app, "a.txt"); // matches only root/a.txt, not deep
-        // deep.txt is gone from the view; the cursor should be on `sub`
-        // (nearest surviving ancestor of deep) or a.txt — never a stale index
-        // pointing at an unrelated row.
+                                        // deep.txt is gone from the view; the cursor should be on `sub`
+                                        // (nearest surviving ancestor of deep) or a.txt — never a stale index
+                                        // pointing at an unrelated row.
         let sel = app.selected_path().unwrap();
         assert!(
             sel == root.join("sub") || sel == root.join("a.txt"),
@@ -2556,7 +2568,11 @@ mod tests {
         // Renaming onto an existing file is refused (ops-level guard).
         fs::write(root.join("b.txt"), b"other").unwrap();
         app.do_rename(&root.join("a.txt"), "b.txt");
-        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"other", "no overwrite");
+        assert_eq!(
+            fs::read(root.join("b.txt")).unwrap(),
+            b"other",
+            "no overwrite"
+        );
         assert!(root.join("a.txt").exists());
     }
 
@@ -2576,7 +2592,9 @@ mod tests {
         fs::write(root.join("sub/missed.txt"), b"x").unwrap();
         app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
         assert!(
-            app.rows.iter().any(|r| r.path == root.join("sub/missed.txt")),
+            app.rows
+                .iter()
+                .any(|r| r.path == root.join("sub/missed.txt")),
             "rescan re-reads expanded dirs and surfaces the missed file"
         );
     }
@@ -2586,7 +2604,10 @@ mod tests {
         let (mut app, _root, _deep) = app_with_tree();
         app.last_input = None;
         app.on_key(key(KeyCode::Char('j'))); // resolves to Down -> acts
-        assert!(app.last_input.is_some(), "a mapped key must arm the grace window");
+        assert!(
+            app.last_input.is_some(),
+            "a mapped key must arm the grace window"
+        );
 
         let (mut app2, _r2, _d2) = app_with_tree();
         app2.last_input = None;
@@ -2605,6 +2626,9 @@ mod tests {
         app.last_input = None;
         app.on_key(key(KeyCode::Char('g')));
         assert!(!app.pending.is_empty(), "g starts a multi-key sequence");
-        assert!(app.last_input.is_some(), "a chord prefix arms the grace window");
+        assert!(
+            app.last_input.is_some(),
+            "a chord prefix arms the grace window"
+        );
     }
 }

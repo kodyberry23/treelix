@@ -270,7 +270,10 @@ mod input_scroll_tests {
                 let text: String = "abcdefghij".chars().cycle().take(n).collect();
                 let state = InputState::new("New", text, InputKind::Create);
                 let (row, cursor_visible) = render_row(width, &state);
-                assert!(cursor_visible, "cursor clipped: width={width} n={n} row={row:?}");
+                assert!(
+                    cursor_visible,
+                    "cursor clipped: width={width} n={n} row={row:?}"
+                );
             }
         }
     }
@@ -377,11 +380,8 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, state: &HelpSta
     } else {
         "press any key to close".to_string()
     };
-    let footer_para = Paragraph::new(Line::from(Span::styled(
-        footer_text,
-        theme.indent_marker,
-    )))
-    .style(theme.help);
+    let footer_para = Paragraph::new(Line::from(Span::styled(footer_text, theme.indent_marker)))
+        .style(theme.help);
     frame.render_widget(footer_para, footer);
 }
 
@@ -396,7 +396,10 @@ pub fn help_line_count(body_width: usize) -> u16 {
 /// left, descriptions wrapping within their own column on the right.
 fn help_lines(theme: &Theme, body_width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled("treelix — keybindings", theme.help_title)));
+    lines.push(Line::from(Span::styled(
+        "treelix — keybindings",
+        theme.help_title,
+    )));
     lines.push(Line::from(""));
 
     let key_col = HELP_ENTRIES

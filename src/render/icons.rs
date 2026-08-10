@@ -56,20 +56,20 @@ fn by_name(name: &str) -> &'static str {
 
 fn by_filename(name: &str) -> Option<&'static str> {
     Some(match name {
-        "cargo.toml" | "cargo.lock" => "\u{e7a8}",            //  rust
-        "package.json" | "package-lock.json" => "\u{e718}",   //  node
-        "yarn.lock" => "\u{e718}",                            //  node
-        "dockerfile" | ".dockerignore" => "\u{f308}",         //  docker
+        "cargo.toml" | "cargo.lock" => "\u{e7a8}", //  rust
+        "package.json" | "package-lock.json" => "\u{e718}", //  node
+        "yarn.lock" => "\u{e718}",                 //  node
+        "dockerfile" | ".dockerignore" => "\u{f308}", //  docker
         "docker-compose.yml" | "docker-compose.yaml" => "\u{f308}",
-        "makefile" => "\u{e673}",                             //  make
+        "makefile" => "\u{e673}", //  make
         ".gitignore" | ".gitattributes" | ".gitmodules" => "\u{f1d3}", //  git
-        ".gitconfig" => "\u{f1d3}",                           //  git
-        "readme.md" | "readme" | "readme.txt" => "\u{f02d}",  //  book
+        ".gitconfig" => "\u{f1d3}", //  git
+        "readme.md" | "readme" | "readme.txt" => "\u{f02d}", //  book
         "license" | "license.md" | "license.txt" => "\u{f02d}", //  book
-        ".env" | ".env.local" => "\u{f013}",                  //  gear
+        ".env" | ".env.local" => "\u{f013}", //  gear
         ".zshrc" | ".bashrc" | ".bash_profile" | ".profile" => "\u{f489}", //  terminal
-        "config.toml" | "config.kdl" => "\u{e615}",           //  config
-        ".editorconfig" => "\u{e615}",                        //  config
+        "config.toml" | "config.kdl" => "\u{e615}", //  config
+        ".editorconfig" => "\u{e615}", //  config
         "flake.nix" | "default.nix" | "shell.nix" => "\u{f313}", //  nix
         _ => return None,
     })
@@ -77,44 +77,44 @@ fn by_filename(name: &str) -> Option<&'static str> {
 
 fn by_extension(ext: &str) -> Option<&'static str> {
     Some(match ext {
-        "rs" => "\u{e7a8}",                                       //  rust
-        "go" => "\u{e627}",                                       //  go
-        "py" | "pyc" | "pyw" => "\u{e606}",                       //  python
-        "js" | "mjs" | "cjs" => "\u{e74e}",                       //  javascript
-        "ts" => "\u{e628}",                                       //  typescript
-        "jsx" => "\u{e7ba}",                                      //  react
-        "tsx" => "\u{e7ba}",                                      //  react
-        "html" | "htm" => "\u{e736}",                            //  html5
-        "css" => "\u{e749}",                                      //  css3
-        "scss" | "sass" => "\u{e603}",                           //  sass
-        "json" | "jsonc" => "\u{e60b}",                          //  json
-        "toml" => "\u{e615}",                                     //  config
-        "yaml" | "yml" => "\u{e615}",                            //  config
-        "md" | "markdown" => "\u{e73e}",                         //  markdown
-        "lua" => "\u{e620}",                                      //  lua
-        "vim" => "\u{e62b}",                                      //  vim
-        "sh" | "bash" | "zsh" | "fish" => "\u{f489}",            //  terminal
-        "c" | "h" => "\u{e61e}",                                  //  c
-        "cpp" | "cc" | "cxx" | "hpp" => "\u{e61d}",              //  c++
-        "java" => "\u{e738}",                                     //  java
-        "kt" | "kts" => "\u{e634}",                              //  kotlin
-        "rb" => "\u{e739}",                                       //  ruby
-        "php" => "\u{e73d}",                                      //  php
-        "ex" | "exs" => "\u{e62d}",                              //  elixir
-        "erl" | "hrl" => "\u{e7b1}",                            //  erlang
-        "hs" => "\u{e777}",                                       //  haskell
-        "nix" => "\u{f313}",                                      //  nix
-        "kdl" => "\u{e615}",                                      //  config
-        "sql" => "\u{f1c0}",                                      //  database
-        "txt" | "log" => "\u{f15c}",                             //  text
-        "pdf" => "\u{f1c1}",                                      //  pdf
+        "rs" => "\u{e7a8}",                                                       //  rust
+        "go" => "\u{e627}",                                                       //  go
+        "py" | "pyc" | "pyw" => "\u{e606}",                                       //  python
+        "js" | "mjs" | "cjs" => "\u{e74e}",                                       //  javascript
+        "ts" => "\u{e628}",                                                       //  typescript
+        "jsx" => "\u{e7ba}",                                                      //  react
+        "tsx" => "\u{e7ba}",                                                      //  react
+        "html" | "htm" => "\u{e736}",                                             //  html5
+        "css" => "\u{e749}",                                                      //  css3
+        "scss" | "sass" => "\u{e603}",                                            //  sass
+        "json" | "jsonc" => "\u{e60b}",                                           //  json
+        "toml" => "\u{e615}",                                                     //  config
+        "yaml" | "yml" => "\u{e615}",                                             //  config
+        "md" | "markdown" => "\u{e73e}",                                          //  markdown
+        "lua" => "\u{e620}",                                                      //  lua
+        "vim" => "\u{e62b}",                                                      //  vim
+        "sh" | "bash" | "zsh" | "fish" => "\u{f489}",                             //  terminal
+        "c" | "h" => "\u{e61e}",                                                  //  c
+        "cpp" | "cc" | "cxx" | "hpp" => "\u{e61d}",                               //  c++
+        "java" => "\u{e738}",                                                     //  java
+        "kt" | "kts" => "\u{e634}",                                               //  kotlin
+        "rb" => "\u{e739}",                                                       //  ruby
+        "php" => "\u{e73d}",                                                      //  php
+        "ex" | "exs" => "\u{e62d}",                                               //  elixir
+        "erl" | "hrl" => "\u{e7b1}",                                              //  erlang
+        "hs" => "\u{e777}",                                                       //  haskell
+        "nix" => "\u{f313}",                                                      //  nix
+        "kdl" => "\u{e615}",                                                      //  config
+        "sql" => "\u{f1c0}",                                                      //  database
+        "txt" | "log" => "\u{f15c}",                                              //  text
+        "pdf" => "\u{f1c1}",                                                      //  pdf
         "zip" | "tar" | "gz" | "tgz" | "xz" | "bz2" | "7z" | "rar" => "\u{f1c6}", //  archive
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" => "\u{f1c5}", //  image
-        "svg" => "\u{f1c5}",                                      //  image
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "\u{f1c7}",    //  audio
-        "mp4" | "mkv" | "mov" | "avi" | "webm" => "\u{f1c8}",    //  video
-        "ttf" | "otf" | "woff" | "woff2" => "\u{f031}",         //  font
-        "git" => "\u{f1d3}",                                      //  git
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" => "\u{f1c5}",    //  image
+        "svg" => "\u{f1c5}",                                                      //  image
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "\u{f1c7}",                     //  audio
+        "mp4" | "mkv" | "mov" | "avi" | "webm" => "\u{f1c8}",                     //  video
+        "ttf" | "otf" | "woff" | "woff2" => "\u{f031}",                           //  font
+        "git" => "\u{f1d3}",                                                      //  git
         _ => return None,
     })
 }
@@ -158,14 +158,38 @@ mod tests {
         // Guard against the table regressing to empty strings (which renders no
         // icons at all). Every structural glyph and a representative spread of
         // file types must resolve to a non-empty glyph.
-        for g in [FOLDER_CLOSED, FOLDER_OPEN, FILE_DEFAULT, SYMLINK, ARROW_CLOSED, ARROW_OPEN, BOOKMARK] {
+        for g in [
+            FOLDER_CLOSED,
+            FOLDER_OPEN,
+            FILE_DEFAULT,
+            SYMLINK,
+            ARROW_CLOSED,
+            ARROW_OPEN,
+            BOOKMARK,
+        ] {
             assert!(!g.is_empty());
         }
         for f in [
-            "main.rs", "app.ts", "index.js", "page.tsx", "style.css", "data.json",
-            "notes.md", "init.lua", "build.gradle.kts", "server.go", "script.py",
-            "Cargo.toml", "package.json", "Dockerfile", "Makefile", ".gitignore",
-            "README.md", "photo.png", "archive.zip", "song.mp3",
+            "main.rs",
+            "app.ts",
+            "index.js",
+            "page.tsx",
+            "style.css",
+            "data.json",
+            "notes.md",
+            "init.lua",
+            "build.gradle.kts",
+            "server.go",
+            "script.py",
+            "Cargo.toml",
+            "package.json",
+            "Dockerfile",
+            "Makefile",
+            ".gitignore",
+            "README.md",
+            "photo.png",
+            "archive.zip",
+            "song.mp3",
         ] {
             assert!(!by_name(f).is_empty(), "empty icon for {f}");
         }

@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(parse_hex("#1A1F28"), Some(Color::Rgb(0x1A, 0x1F, 0x28)));
         assert_eq!(parse_hex("zqx"), None); // non-hex letters
         assert_eq!(parse_hex("nothex"), None); // 6 chars, not all hex
-        // 3-digit hex expands by doubling each nibble.
+                                               // 3-digit hex expands by doubling each nibble.
         assert_eq!(parse_hex("#abc"), Some(Color::Rgb(0xAA, 0xBB, 0xCC)));
         assert_eq!(parse_hex("#f00"), Some(Color::Rgb(0xFF, 0x00, 0x00)));
     }
@@ -437,7 +437,10 @@ mod tests {
     fn named_ansi_colors_resolve() {
         let empty = HashMap::new();
         assert_eq!(resolve_color("light-blue", &empty), Some(Color::LightBlue));
-        assert_eq!(resolve_color("light-green", &empty), Some(Color::LightGreen));
+        assert_eq!(
+            resolve_color("light-green", &empty),
+            Some(Color::LightGreen)
+        );
         assert_eq!(resolve_color("red", &empty), Some(Color::Red));
         assert_eq!(resolve_color("gray", &empty), Some(Color::DarkGray));
         assert_eq!(resolve_color("light-gray", &empty), Some(Color::Gray));

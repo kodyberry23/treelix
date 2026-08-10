@@ -314,7 +314,10 @@ mod tests {
         fs::create_dir(&fakehome).unwrap();
         let res = trash_impl(&d.join("precious"), false, Some(fakehome.into_os_string()));
         assert!(res.is_err(), "no trash mechanism must be an error");
-        assert!(d.join("precious/data.txt").exists(), "nothing may be deleted");
+        assert!(
+            d.join("precious/data.txt").exists(),
+            "nothing may be deleted"
+        );
         // No CLI, no HOME at all.
         let res = trash_impl(&d.join("precious"), false, None);
         assert!(res.is_err());
@@ -322,8 +325,16 @@ mod tests {
         // With a real .Trash dir the rename path still works.
         let home2 = d.join("home2");
         fs::create_dir_all(home2.join(".Trash")).unwrap();
-        trash_impl(&d.join("precious"), false, Some(home2.clone().into_os_string())).unwrap();
-        assert!(home2.join(".Trash/precious/data.txt").exists(), "moved into trash");
+        trash_impl(
+            &d.join("precious"),
+            false,
+            Some(home2.clone().into_os_string()),
+        )
+        .unwrap();
+        assert!(
+            home2.join(".Trash/precious/data.txt").exists(),
+            "moved into trash"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

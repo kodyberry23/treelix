@@ -342,8 +342,11 @@ impl Tree {
         };
         node.loaded_mtime = mtime;
         // Index existing children so survivors keep their expansion/subtree.
-        let mut old: HashMap<PathBuf, Node> =
-            node.children.drain(..).map(|c| (c.path.clone(), c)).collect();
+        let mut old: HashMap<PathBuf, Node> = node
+            .children
+            .drain(..)
+            .map(|c| (c.path.clone(), c))
+            .collect();
         let mut merged = Vec::with_capacity(fresh.len());
         for f in fresh {
             match old.remove(&f.path) {
@@ -522,7 +525,6 @@ impl Tree {
         }
         true
     }
-
 }
 
 fn node_cmp(a: &Node, b: &Node, mode: SortMode, files_first: bool) -> std::cmp::Ordering {
@@ -720,9 +722,15 @@ mod tests {
 
         // The non-ignored parents must keep git == None (not propagated Ignored).
         let pkg_a_git = tree.root.find_mut(&d.join("packages/pkg-a")).unwrap().git;
-        assert_eq!(pkg_a_git, None, "pkg-a must not inherit child Ignored status");
+        assert_eq!(
+            pkg_a_git, None,
+            "pkg-a must not inherit child Ignored status"
+        );
         let packages_git = tree.root.find_mut(&d.join("packages")).unwrap().git;
-        assert_eq!(packages_git, None, "packages/ must not inherit child Ignored status");
+        assert_eq!(
+            packages_git, None,
+            "packages/ must not inherit child Ignored status"
+        );
         // The leaf dir git reported as ignored keeps its own status.
         let nm_git = tree
             .root
@@ -735,9 +743,15 @@ mod tests {
         let opts = ViewOptions::default();
         let rows = tree.flatten(&opts);
         let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
-        assert!(names.iter().any(|n| *n == "packages"), "packages/ stays visible");
+        assert!(
+            names.iter().any(|n| *n == "packages"),
+            "packages/ stays visible"
+        );
         assert!(names.iter().any(|n| *n == "pkg-a"), "pkg-a stays visible");
-        assert!(!names.iter().any(|n| *n == "node_modules"), "node_modules hidden");
+        assert!(
+            !names.iter().any(|n| *n == "node_modules"),
+            "node_modules hidden"
+        );
         assert!(!names.iter().any(|n| *n == "dist"), "dist hidden");
         let _ = fs::remove_dir_all(&d);
     }
@@ -776,14 +790,23 @@ mod tests {
 
         let rows = tree.flatten(&ViewOptions::default());
         let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
-        assert!(names.iter().any(|n| *n == "new.txt"), "new file should appear");
-        assert!(!names.iter().any(|n| *n == "old.txt"), "removed file should be gone");
+        assert!(
+            names.iter().any(|n| *n == "new.txt"),
+            "new file should appear"
+        );
+        assert!(
+            !names.iter().any(|n| *n == "old.txt"),
+            "removed file should be gone"
+        );
         // The previously-expanded sub/inner subtree must survive the merge.
         assert!(
             tree.collect_expanded().contains(&d.join("sub/inner")),
             "expansion state of untouched subtree should be preserved"
         );
-        assert!(names.iter().any(|n| *n == "deep.txt"), "deep file still visible");
+        assert!(
+            names.iter().any(|n| *n == "deep.txt"),
+            "deep file still visible"
+        );
 
         // Refreshing an unloaded/absent dir is a no-op returning false.
         assert!(!tree.refresh_dir(&d.join("does-not-exist")));
@@ -812,8 +835,14 @@ mod tests {
         tree.expand(&d.join("sub"));
         let rows = tree.flatten(&ViewOptions::default());
         let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
-        assert!(names.iter().any(|n| *n == "new.txt"), "missed file appears on expand");
-        assert!(!names.iter().any(|n| *n == "old.txt"), "missed deletion applied on expand");
+        assert!(
+            names.iter().any(|n| *n == "new.txt"),
+            "missed file appears on expand"
+        );
+        assert!(
+            !names.iter().any(|n| *n == "old.txt"),
+            "missed deletion applied on expand"
+        );
         // inner survived the merge with its expansion state intact.
         assert!(
             tree.collect_expanded().contains(&d.join("sub/inner")),
@@ -834,7 +863,10 @@ mod tests {
         tree.expand(&d.join("sub"));
         fs::remove_dir_all(d.join("sub")).unwrap();
 
-        assert!(!tree.refresh_dir(&d.join("sub")), "unreadable dir: no refresh");
+        assert!(
+            !tree.refresh_dir(&d.join("sub")),
+            "unreadable dir: no refresh"
+        );
         let sub = tree.root.find_mut(&d.join("sub")).unwrap();
         assert!(
             sub.children.iter().any(|c| c.name == "kept.txt"),
