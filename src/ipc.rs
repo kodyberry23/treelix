@@ -140,10 +140,8 @@ fn handle(stream: UnixStream, sender: &Sender<Reveal>) {
 fn parse_line(line: &str) -> Option<Reveal> {
     let (rest, follow) = if let Some(rest) = line.strip_prefix("reveal-follow ") {
         (rest, true)
-    } else if let Some(rest) = line.strip_prefix("reveal ") {
-        (rest, false)
     } else {
-        return None;
+        (line.strip_prefix("reveal ")?, false)
     };
     (!rest.is_empty()).then(|| Reveal {
         path: PathBuf::from(rest),
