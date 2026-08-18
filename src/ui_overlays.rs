@@ -204,9 +204,7 @@ mod input_scroll_tests {
             .draw(|f| render_input(f, f.area(), &theme, state))
             .unwrap();
         let buf = terminal.backend().buffer();
-        let row: String = (0..width)
-            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
-            .collect();
+        let row = crate::test_util::buffer_row_text(buf, 1);
         let cursor_visible = (0..width).any(|x| {
             buf.cell((x, 1))
                 .unwrap()

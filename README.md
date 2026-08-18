@@ -142,6 +142,7 @@ sort = "name"           # name | modified | extension | filetype
 files_first = false     # place files before directories
 group_empty = false     # collapse chains of sole-child dirs into one line
 mouse = true            # click to open/cd, scroll to move
+scrolloff = 5           # rows kept visible beyond the cursor, like Vim/Helix
 bookmarks_persist = false   # persist bookmarks to ~/.config/treelix/bookmarks
 live_filter_show_folders = false  # true → every folder stays visible during `f`;
                                   #   false → only matches + their ancestors

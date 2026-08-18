@@ -78,6 +78,11 @@ pub struct App {
     rows: Vec<Row>,
     list_state: ListState,
     list_area: Rect,
+    /// Set when the user just expanded the selected directory: the next draw
+    /// nudges the offset so its first children are visible even when they
+    /// were inserted below the fold (and even at scrolloff = 0, where
+    /// scroll_padding alone keeps only the selected row in view).
+    reveal_children: bool,
     theme: Theme,
     config: Config,
     clipboard: Clipboard,
@@ -184,6 +189,7 @@ impl App {
             rows: Vec::new(),
             list_state: ListState::default(),
             list_area: Rect::default(),
+            reveal_children: false,
             theme,
             clipboard: Clipboard::default(),
             marks: Marks::load(config.bookmarks_persist),
@@ -839,6 +845,7 @@ impl App {
             return;
         };
         if row.kind.is_dir() {
+            self.reveal_children = !row.expanded;
             self.tree.toggle(&row.path);
             self.note_user_expansion(&row.path);
             self.tree.apply_git(&self.git);
@@ -868,6 +875,7 @@ impl App {
             return;
         };
         if row.kind.is_dir() && !row.expanded {
+            self.reveal_children = true;
             self.tree.expand(&row.path);
             self.note_user_expansion(&row.path);
             self.tree.apply_git(&self.git);
@@ -1489,6 +1497,12 @@ impl App {
         // cursor NEAR where it was, in a related row). Only if neither exists
         // do we keep the prior index — never a stale raw offset onto an
         // unrelated file.
+        //
+        // View consistency is a two-part contract: this clamp keeps the
+        // SELECTION valid for the new rows; the SCROLL OFFSET (and the
+        // reveal-children nudge) is repaired in draw(), the only place the
+        // true viewport height is known. Any new code that mutates
+        // self.rows must route through here so both halves apply.
         let idx = preserve
             .as_deref()
             .and_then(|p| self.row_index_for(p))
@@ -1974,7 +1988,46 @@ impl App {
             let items = render::build_items(&self.rows, &self.theme, &opts, &decor);
             let list = List::new(items)
                 .style(self.theme.text)
-                .highlight_style(self.theme.selection);
+                .highlight_style(self.theme.selection)
+                .scroll_padding(self.config.scrolloff);
+            // Ratatui scrolls only far enough to keep the selection visible
+            // and clamps a stale offset to len-1, never to len-height. When
+            // the row count shrinks (collapse, filter) or the pane grows, the
+            // leftover offset top-anchors the tail of the tree over a pane of
+            // blank rows until the cursor crawls back up one row per press.
+            // Enforce the missing invariant here — the one place the true
+            // viewport height for this frame is known. (The selection half of
+            // the contract lives in refresh_rows; the reveal-children nudge
+            // below is the third piece of the same view-consistency story.)
+            let max_offset = self.rows.len().saturating_sub(chunks[1].height as usize);
+            if self.list_state.offset() > max_offset {
+                *self.list_state.offset_mut() = max_offset;
+            }
+            // A directory the user just expanded must show its first children
+            // even when they were inserted below the fold. scroll_padding
+            // covers this only for scrolloff >= 1 (it keeps rows around the
+            // SELECTED row visible); at scrolloff = 0 the selected dir row
+            // hasn't moved, so ratatui has no reason to scroll and the pane
+            // shows an open chevron over nothing.
+            if std::mem::take(&mut self.reveal_children) {
+                if let (Some(sel), h @ 1..) =
+                    (self.list_state.selected(), chunks[1].height as usize)
+                {
+                    if let Some(dir) = self.rows.get(sel) {
+                        let children = self.rows[sel + 1..]
+                            .iter()
+                            .take_while(|r| r.depth > dir.depth)
+                            .count();
+                        let want = children.min(self.config.scrolloff.max(1));
+                        // Smallest offset that keeps row sel+want inside the
+                        // viewport; never scroll the selected row itself out.
+                        let need = (sel + want + 1).saturating_sub(h);
+                        if self.list_state.offset() < need {
+                            *self.list_state.offset_mut() = need.min(max_offset).min(sel);
+                        }
+                    }
+                }
+            }
             frame.render_stateful_widget(list, chunks[1], &mut self.list_state);
 
             frame.render_widget(Paragraph::new(self.status_line()), chunks[2]);
@@ -2032,6 +2085,15 @@ impl App {
         }
         if self.no_buffer {
             flags.push('B');
+        }
+        // The two toggles that silently reshape the view: without a
+        // persistent flag, a stray `L` (shift-adjacent to `l` while
+        // expanding) or `U` announced itself only in a 4s transient message.
+        if self.custom_active {
+            flags.push('U');
+        }
+        if self.tree.group_empty {
+            flags.push('L');
         }
         if !flags.is_empty() {
             parts.push(format!("[{flags}]"));
@@ -2208,6 +2270,135 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// List viewport height in the standard test terminal: TEST_H rows minus
+    /// the 1-row header and 1-row status line.
+    const VIEWPORT: usize = (TEST_H - 2) as usize;
+    const TEST_W: u16 = 40;
+    const TEST_H: u16 = 20;
+
+    fn test_terminal() -> Terminal<ratatui::backend::TestBackend> {
+        Terminal::new(ratatui::backend::TestBackend::new(TEST_W, TEST_H)).unwrap()
+    }
+
+    /// The text of one terminal row of the last-drawn frame.
+    fn row_text(terminal: &Terminal<ratatui::backend::TestBackend>, y: u16) -> String {
+        crate::test_util::buffer_row_text(terminal.backend().buffer(), y)
+    }
+
+    /// Regression: ratatui clamps a stale ListState offset to len-1, not
+    /// len-height, so shrinking the row count while scrolled deep used to
+    /// leave the last row top-anchored over a pane of blanks (and each `k`
+    /// recovered exactly one row). The draw() clamp must bottom-anchor it.
+    #[test]
+    fn shrinking_rows_keeps_viewport_bottom_anchored() {
+        let root = fs::canonicalize(unique_tmpdir()).unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        for i in 0..40 {
+            fs::write(root.join(format!("dir/f{i:02}.txt")), b"x").unwrap();
+        }
+        for i in 0..30 {
+            fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
+        }
+        let mut app = App::new(root.clone(), Config::default(), Theme::default());
+        let mut terminal = test_terminal();
+        // Dirs sort first, so row 0 is `dir`. Expand it (71 rows), select the
+        // last row, and render so ratatui drives the offset deep.
+        app.dispatch(Action::Expand);
+        assert_eq!(app.rows.len(), 71);
+        app.list_state.select(Some(app.rows.len() - 1));
+        app.draw(&mut terminal).unwrap();
+        assert!(app.list_state.offset() > 33, "offset went deep");
+        // Collapse everything: 31 rows remain, selection preserved on the
+        // last file, the stale offset (>33) now exceeds len - viewport.
+        app.dispatch(Action::CollapseAll);
+        app.draw(&mut terminal).unwrap();
+        assert_eq!(app.rows.len(), 31);
+        assert_eq!(app.list_state.offset(), app.rows.len() - VIEWPORT);
+        assert!(
+            row_text(&terminal, VIEWPORT as u16).contains("file29"),
+            "last row pinned to the pane bottom: {:?}",
+            row_text(&terminal, VIEWPORT as u16)
+        );
+        assert!(
+            !row_text(&terminal, 1).trim().is_empty(),
+            "no blank rows at the top of the pane"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Regression: expanding a directory whose row sits on the bottom of the
+    /// viewport inserted every child below the fold — open chevron, zero
+    /// visible children. scroll_padding must pull the first children into view.
+    #[test]
+    fn expanding_a_dir_on_the_bottom_row_reveals_children() {
+        let root = fs::canonicalize(unique_tmpdir()).unwrap();
+        for d in 0..25 {
+            let dir = root.join(format!("d{d:02}"));
+            fs::create_dir(&dir).unwrap();
+            for f in 0..5 {
+                fs::write(dir.join(format!("c{f}.txt")), b"x").unwrap();
+            }
+        }
+        let mut app = App::new(root.clone(), Config::default(), Theme::default());
+        let mut terminal = test_terminal();
+        // Select the LAST row (a dir) and render: it sits on the bottom row.
+        app.list_state.select(Some(app.rows.len() - 1));
+        app.draw(&mut terminal).unwrap();
+        assert!(
+            row_text(&terminal, VIEWPORT as u16).contains("d24"),
+            "d24 on the bottom row"
+        );
+        // Expand it. Its five children must not all land below the fold.
+        app.dispatch(Action::Expand);
+        app.draw(&mut terminal).unwrap();
+        let screen: String = (1..=VIEWPORT as u16)
+            .map(|y| row_text(&terminal, y))
+            .collect();
+        assert!(
+            screen.contains("c0.txt"),
+            "children of the expanded dir are visible: {screen}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Regression: the reveal must not depend on scroll_padding. With
+    /// scrolloff = 0 (a legitimate config value), ratatui has no reason to
+    /// scroll — the selected dir row hasn't moved — so without the explicit
+    /// reveal nudge the expanded dir showed an open chevron over nothing.
+    #[test]
+    fn expanding_at_bottom_reveals_a_child_even_with_scrolloff_zero() {
+        let root = fs::canonicalize(unique_tmpdir()).unwrap();
+        for d in 0..25 {
+            let dir = root.join(format!("d{d:02}"));
+            fs::create_dir(&dir).unwrap();
+            for f in 0..5 {
+                fs::write(dir.join(format!("c{f}.txt")), b"x").unwrap();
+            }
+        }
+        let config = Config {
+            scrolloff: 0,
+            ..Config::default()
+        };
+        let mut app = App::new(root.clone(), config, Theme::default());
+        let mut terminal = test_terminal();
+        app.list_state.select(Some(app.rows.len() - 1));
+        app.draw(&mut terminal).unwrap();
+        assert!(
+            row_text(&terminal, VIEWPORT as u16).contains("d24"),
+            "d24 on the bottom row"
+        );
+        app.dispatch(Action::Expand);
+        app.draw(&mut terminal).unwrap();
+        let screen: String = (1..=VIEWPORT as u16)
+            .map(|y| row_text(&terminal, y))
+            .collect();
+        assert!(
+            screen.contains("c0.txt"),
+            "at least the first child is visible at scrolloff 0: {screen}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

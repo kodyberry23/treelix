@@ -157,6 +157,13 @@ impl Tree {
                 match next {
                     Some(child) => {
                         self.do_expand(&child);
+                        // do_expand refuses unreadable dirs (they stay
+                        // collapsed so the next keypress retries). Stop the
+                        // walk there — group_chain folds expanded nodes only,
+                        // and advancing past a refusal would desync the two.
+                        if !matches!(self.root.find(&child), Some(n) if n.expanded) {
+                            break;
+                        }
                         cur = child;
                     }
                     None => break,
@@ -238,7 +245,12 @@ impl Tree {
             Some(State::Fresh) | None => {}
         }
         if let Some(node) = self.root.find_mut(path) {
-            if node.is_dir() {
+            // Only a dir whose children were actually read may be marked
+            // expanded. After a failed read (permission denied, transient
+            // EMFILE) the row must stay collapsed so expand retries the read
+            // on the next keypress — expanded-but-unloaded froze an open
+            // chevron over nothing, with expand_current refusing to re-expand.
+            if node.is_dir() && node.loaded {
                 node.expanded = true;
             }
         }
@@ -485,7 +497,14 @@ impl Tree {
         let mut cur = node;
         while opts.group_empty && cur.expanded {
             let vis = self.visible_sorted(cur, opts);
-            if vis.len() == 1 && vis[0].is_dir() {
+            // Fold only EXPANDED children into the chain. Render-time
+            // visibility (git-clean/custom/restrict filters, disk changes
+            // pruning a sibling, the high-churn guard) can produce a sole
+            // visible child that chain-expansion never descended into;
+            // folding that unloaded child used to render an open chevron
+            // with no contents that no key could ever open. Left unfolded it
+            // is a normal collapsed row, and `l` expands it.
+            if vis.len() == 1 && vis[0].is_dir() && vis[0].expanded {
                 cur = vis[0];
                 name = format!("{name}/{}", cur.name);
             } else {
@@ -946,6 +965,94 @@ mod tests {
             !nm.loaded,
             "high-churn sole child must not be chain-expanded/loaded"
         );
+        // The render side must agree: group_chain must NOT fold the
+        // unexpanded node_modules into "pkg/node_modules" (an unopenable row
+        // with an open chevron and no contents). It renders as a normal
+        // collapsed child of pkg instead.
+        let opts = ViewOptions {
+            group_empty: true,
+            ..Default::default()
+        };
+        let rows = tree.flatten(&opts);
+        let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
+        assert!(
+            names.iter().any(|n| *n == "pkg"),
+            "pkg stays its own row: {names:?}"
+        );
+        let nm_row = rows.iter().find(|r| r.name == "node_modules").unwrap();
+        assert!(
+            !nm_row.expanded && nm_row.has_children,
+            "node_modules renders collapsed and openable"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn group_chain_never_folds_an_unexpanded_child_after_disk_drift() {
+        // Regression: `top` has two children so chain-expansion correctly
+        // stops at it, leaving `keep` unloaded. When the sibling is later
+        // deleted on disk and refresh_dir prunes it, `keep` becomes the sole
+        // visible child — group_chain used to descend into it at render time,
+        // producing a permanently empty "top/keep" row that `l`, Enter, `R`,
+        // and a full rescan could not heal.
+        let d = tmpdir("group-drift");
+        fs::create_dir_all(d.join("top/keep")).unwrap();
+        fs::write(d.join("top/keep/a.txt"), b"x").unwrap();
+        fs::write(d.join("top/sibling.txt"), b"x").unwrap();
+        let mut tree = Tree::new(d.clone());
+        tree.group_empty = true;
+        tree.expand(&d.join("top"));
+        // Disk drift: the sibling disappears; the watcher path refreshes top.
+        fs::remove_file(d.join("top/sibling.txt")).unwrap();
+        tree.refresh_dir(&d.join("top"));
+        let opts = ViewOptions {
+            group_empty: true,
+            ..Default::default()
+        };
+        let rows = tree.flatten(&opts);
+        let names: Vec<&String> = rows.iter().map(|r| &r.name).collect();
+        assert!(
+            names.iter().any(|n| *n == "top"),
+            "top must not fold into an unloaded keep: {names:?}"
+        );
+        let keep = rows.iter().find(|r| r.name == "keep").unwrap();
+        assert!(!keep.expanded && keep.has_children, "keep is openable");
+        // And expanding it works, folding the now-loaded chain normally.
+        tree.expand(&d.join("top/keep"));
+        let rows = tree.flatten(&opts);
+        assert!(
+            rows.iter().any(|r| r.name == "a.txt"),
+            "expanding keep reveals its file: {:?}",
+            rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_read_leaves_dir_collapsed_so_expand_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("noperm");
+        let locked = d.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inner.txt"), b"x").unwrap();
+        let mut tree = Tree::new(d.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        tree.expand(&locked);
+        let n = tree.root.find(&locked).unwrap();
+        assert!(
+            !n.expanded && !n.loaded,
+            "unreadable dir must stay collapsed (was: expanded={} loaded={})",
+            n.expanded,
+            n.loaded
+        );
+        // Once readable again, the SAME keypress path succeeds — no restart,
+        // no collapse-first dance.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        tree.expand(&locked);
+        let n = tree.root.find(&locked).unwrap();
+        assert!(n.expanded && n.loaded, "retry after chmod succeeds");
+        assert!(n.children.iter().any(|c| c.name == "inner.txt"));
         let _ = fs::remove_dir_all(&d);
     }
 }

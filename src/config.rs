@@ -30,6 +30,11 @@ pub struct Config {
     pub group_empty: bool,
     /// Enable mouse support (click to open/cd, scroll).
     pub mouse: bool,
+    /// Rows kept visible beyond the cursor while scrolling, like Vim/Helix
+    /// `scrolloff`. Also guarantees a directory expanded while the cursor
+    /// sits on the bottom row shows this many of its children instead of
+    /// inserting them all below the fold.
+    pub scrolloff: usize,
     /// Persist bookmarks to `~/.config/treelix/bookmarks`.
     pub bookmarks_persist: bool,
     /// Keep ALL folders visible during a live filter (`f`), even ones that
@@ -61,6 +66,7 @@ impl Default for Config {
             files_first: false,
             group_empty: false,
             mouse: true,
+            scrolloff: 5,
             bookmarks_persist: false,
             live_filter_show_folders: false,
             exclude: Vec::new(),

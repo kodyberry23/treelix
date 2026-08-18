@@ -179,3 +179,16 @@ fn restore_terminal(mouse: bool) -> Result<()> {
     disable_raw_mode()?;
     Ok(())
 }
+
+/// Test-only helpers shared across modules' unit tests.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use ratatui::buffer::Buffer;
+
+    /// The text of terminal row `y` in a rendered buffer.
+    pub fn buffer_row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect()
+    }
+}
