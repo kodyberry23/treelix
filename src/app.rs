@@ -418,8 +418,7 @@ impl App {
                 if self.diagnostics_mode == diagnostics::Mode::Off {
                     return;
                 }
-                let mut roots = HashMap::new();
-                let path = self.path_into_tree(&path, &mut roots);
+                let path = self.path_mapper().map(&path);
                 if self.diagnostics.update(path, counts) {
                     self.diagnostics_changed();
                 }
@@ -434,10 +433,10 @@ impl App {
                     }
                 }
                 self.diagnostics_origin = Some((sender, seq));
-                let mut roots = HashMap::new();
+                let mut mapper = self.path_mapper();
                 let files: Vec<_> = files
                     .into_iter()
-                    .map(|(path, counts)| (self.path_into_tree(&path, &mut roots), counts))
+                    .map(|(path, counts)| (mapper.map(&path), counts))
                     .collect();
                 if self.diagnostics.replace(files) {
                     self.diagnostics_changed();
@@ -1538,28 +1537,20 @@ impl App {
         });
     }
 
-    /// Map a path the editor reported onto the tree's keys. Tree nodes are
-    /// keyed by the canonical root plus the lexical path below it (an in-tree
-    /// symlinked directory keeps its own node), while the editor sends
-    /// lexically normalized paths whose root prefix may be a symlink (macOS
-    /// `/tmp`, a linked project directory). So: find the ancestor that IS the
-    /// tree root once canonicalized, and keep everything below it as sent.
-    /// Paths outside the tree are canonicalized as a whole. `roots` memoizes
-    /// ancestor lookups across one batch.
-    fn path_into_tree(&self, path: &Path, roots: &mut HashMap<PathBuf, bool>) -> PathBuf {
-        let root = &self.tree.root.path;
-        for ancestor in path.ancestors() {
-            let is_root = *roots.entry(ancestor.to_path_buf()).or_insert_with(|| {
-                ancestor == root || std::fs::canonicalize(ancestor).is_ok_and(|real| real == *root)
-            });
-            if is_root {
-                return match path.strip_prefix(ancestor) {
-                    Ok(rest) => root.join(rest),
-                    Err(_) => root.clone(),
-                };
-            }
+    /// A mapper from editor-reported paths onto this tree's keys, valid for
+    /// one batch (the root cannot change inside one event).
+    fn path_mapper(&self) -> PathMapper {
+        let root = self.tree.root.path.clone();
+        // The root may itself be a symlink (`cd` into one), so compare
+        // canonical forms too.
+        let root_real = std::fs::canonicalize(&root)
+            .ok()
+            .filter(|real| *real != root);
+        PathMapper {
+            root,
+            root_real,
+            memo: HashMap::new(),
         }
-        canonicalize_lenient(path)
     }
 
     /// The diagnostics set changed: recolor and redraw.
@@ -2328,6 +2319,47 @@ fn human_ago(t: SystemTime) -> String {
 /// existing ancestor (following symlinks) and re-attach the remaining
 /// components. Used to bring incoming reveal paths into the same namespace as
 /// the canonicalized tree root. Falls back to the input if nothing resolves.
+/// Maps paths the editor reports onto the tree's keys. Tree nodes are keyed
+/// by the root plus the lexical path below it (an in-tree symlinked directory
+/// keeps its own node), while the editor sends lexically normalized paths
+/// whose root prefix may be a symlink (macOS `/tmp`, a linked project
+/// directory). So: find the ancestor that IS the tree root once canonicalized
+/// and keep everything below it as sent. Paths outside the tree are
+/// canonicalized as a whole.
+struct PathMapper {
+    root: PathBuf,
+    /// The root's canonical form when that differs from `root`
+    root_real: Option<PathBuf>,
+    /// Ancestor -> "is the root", cached across one batch
+    memo: HashMap<PathBuf, bool>,
+}
+
+impl PathMapper {
+    fn map(&mut self, path: &Path) -> PathBuf {
+        // A file can never be the directory root: start at its parent.
+        for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+            let is_root = match self.memo.get(ancestor) {
+                Some(known) => *known,
+                None => {
+                    let known = ancestor == self.root
+                        || std::fs::canonicalize(ancestor).is_ok_and(|real| {
+                            real == self.root || Some(&real) == self.root_real.as_ref()
+                        });
+                    self.memo.insert(ancestor.to_path_buf(), known);
+                    known
+                }
+            };
+            if is_root {
+                return match path.strip_prefix(ancestor) {
+                    Ok(rest) => self.root.join(rest),
+                    Err(_) => self.root.clone(),
+                };
+            }
+        }
+        canonicalize_lenient(path)
+    }
+}
+
 fn canonicalize_lenient(p: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(p) {
         return real;
@@ -2562,6 +2594,32 @@ mod tests {
             diag_of(&app, &linked).map(|d| d.severity),
             Some(Severity::Error),
             "the symlinked directory's own node is colored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_map_when_the_root_itself_is_a_symlink() {
+        use crate::diagnostics::{Counts, Severity};
+        let real = fs::canonicalize(unique_tmpdir()).unwrap();
+        fs::write(real.join("a.txt"), b"x").unwrap();
+        let links = unique_tmpdir();
+        let link_root = links.join("root");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+        // The tree is rooted at the symlink (what `cd` into a symlinked
+        // directory produces); the editor reports the real path.
+        let mut app = App::new(link_root.clone(), Config::default(), Theme::default());
+        app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+            path: real.join("a.txt"),
+            counts: Counts {
+                errors: 1,
+                warnings: 0,
+            },
+        }));
+        assert_eq!(
+            diag_of(&app, &link_root.join("a.txt")).map(|d| d.severity),
+            Some(Severity::Error),
+            "mapped onto the symlinked root's node"
         );
     }
 
