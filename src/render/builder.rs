@@ -90,6 +90,14 @@ fn build_line<'a>(row: &Row, theme: &Theme, opts: &RenderOpts, decor: &Decor) ->
     let name_style = decorators::name_style(row, theme, decor);
     spans.push(Span::styled(row.name.clone(), name_style));
 
+    // Diagnostic count (files only; a folder just takes the color).
+    if let Some(diag) = row.diag.filter(|d| d.count > 0) {
+        spans.push(Span::styled(
+            format!(" {}", diag.count),
+            theme.diagnostic_style(diag.severity),
+        ));
+    }
+
     // Bookmark glyph.
     if decor.marks.contains(&row.path) {
         spans.push(Span::raw(" "));
@@ -211,10 +219,122 @@ mod tests {
             has_children: kind.is_dir(),
             executable: false,
             git: None,
+            diag: None,
             link_to: None,
             group_target: None,
             ancestor_last,
         }
+    }
+
+    #[test]
+    fn diagnostics_outrank_git_in_the_name_color() {
+        use crate::diagnostics::{Diag, Severity};
+        use crate::git::GitStatus;
+        let theme = Theme::default();
+        let clipboard = Clipboard::default();
+        let marks = HashSet::new();
+        let selection = HashSet::new();
+        let decor = Decor {
+            clipboard: &clipboard,
+            marks: &marks,
+            selection: &selection,
+            current_file: None,
+            special_files: &[],
+        };
+        let mut r = row("main.rs", NodeKind::File, vec![true]);
+        r.git = Some(GitStatus::Dirty);
+        assert_eq!(
+            decorators::name_style(&r, &theme, &decor).fg,
+            theme.git_dirty.fg,
+            "git alone colors the name"
+        );
+        r.diag = Some(Diag {
+            severity: Severity::Warning,
+            count: 1,
+        });
+        assert_eq!(
+            decorators::name_style(&r, &theme, &decor).fg,
+            theme.diagnostic_warning.fg
+        );
+        r.diag = Some(Diag {
+            severity: Severity::Error,
+            count: 2,
+        });
+        assert_eq!(
+            decorators::name_style(&r, &theme, &decor).fg,
+            theme.diagnostic_error.fg,
+            "an error beats both the warning color and git"
+        );
+        let mut exe = row("run.sh", NodeKind::File, vec![true]);
+        exe.executable = true;
+        exe.diag = r.diag;
+        assert_eq!(
+            decorators::name_style(&exe, &theme, &decor).fg,
+            theme.diagnostic_error.fg,
+            "and the executable color"
+        );
+        let opened = Decor {
+            current_file: Some(r.path.as_path()),
+            ..decor
+        };
+        let style = decorators::name_style(&r, &theme, &opened);
+        assert_eq!(
+            style.fg, theme.diagnostic_error.fg,
+            "and the opened-in-editor color"
+        );
+        assert!(
+            style.add_modifier.contains(theme.opened.add_modifier),
+            "while keeping the opened modifiers"
+        );
+    }
+
+    #[test]
+    fn diagnostic_count_follows_the_file_name_but_not_a_folder() {
+        use crate::diagnostics::{Diag, Severity};
+        let mut file = row("main.rs", NodeKind::File, vec![true]);
+        file.diag = Some(Diag {
+            severity: Severity::Error,
+            count: 3,
+        });
+        let mut dir = row("src", NodeKind::Directory, vec![false]);
+        dir.diag = Some(Diag {
+            severity: Severity::Error,
+            count: 0,
+        });
+        let theme = Theme::default();
+        let opts = RenderOpts {
+            icons_enabled: false,
+            show_arrows: false,
+            indent_markers: false,
+        };
+        let clipboard = Clipboard::default();
+        let marks = HashSet::new();
+        let selection = HashSet::new();
+        let decor = Decor {
+            clipboard: &clipboard,
+            marks: &marks,
+            selection: &selection,
+            current_file: None,
+            special_files: &[],
+        };
+        let items = build_items(&[dir, file], &theme, &opts, &decor);
+        let backend = TestBackend::new(30, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(List::new(items), f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("main.rs 3"), "{text:?}");
+        assert!(
+            !text.contains("src 0") && !text.contains("src 3"),
+            "{text:?}"
+        );
     }
 
     #[test]

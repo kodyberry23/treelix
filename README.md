@@ -138,6 +138,8 @@ indent_markers = false  # true → tree connector lines (│ ├ └); false →
                         #   indentation with chevrons, nvim-tree style
 show_hidden = false     # initial state of dotfiles (`.` toggles this + ignored)
 show_ignored = false    # initial state of git-ignored entries
+diagnostics = "warnings" # LSP diagnostics pushed by the patched Helix color file
+                         #   names: "warnings" (errors + warnings), "errors", "off"
 sort = "name"           # name | modified | extension | filetype
 files_first = false     # place files before directories
 group_empty = false     # collapse chains of sole-child dirs into one line
@@ -155,7 +157,7 @@ exclude = []            # substring patterns hidden when custom filter (U) is on
 
 A treelix theme is a TOML file (`~/.config/treelix/themes/<name>.toml`) with a
 `[palette]` of `name = "#hex"` and a `[styles]` table mapping treelix elements
-(`text`, `directory`, `git_staged`, …) to `"fg"`, `"fg / bg"`, or
+(`text`, `directory`, `git_staged`, `diagnostic_error`, …) to `"fg"`, `"fg / bg"`, or
 `"fg / bg / mods"` specs. See [`themes/nord-aurora.toml`](themes/nord-aurora.toml).
 
 ## Opening files in Helix

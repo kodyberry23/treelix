@@ -3,6 +3,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod diagnostics;
 mod editor;
 mod git;
 mod ipc;

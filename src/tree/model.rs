@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::diagnostics::{Diag, DiagnosticsData, Mode as DiagnosticsMode, Severity};
 use crate::git::{GitData, GitStatus};
 
 use super::node::{Node, NodeKind};
@@ -73,6 +74,7 @@ pub struct Row {
     pub has_children: bool,
     pub executable: bool,
     pub git: Option<GitStatus>,
+    pub diag: Option<Diag>,
     pub link_to: Option<PathBuf>,
     /// For group-empty rows, the deepest directory in the chain (target for
     /// cd/create); `None` when not a grouped row.
@@ -432,6 +434,24 @@ impl Tree {
         walk(&mut self.root, &data.statuses);
     }
 
+    /// Apply editor diagnostics to file nodes and propagate the worst severity
+    /// to directories. Directories are judged by the reported paths below
+    /// them, not by loaded children, so a never-expanded folder still shows
+    /// what it contains.
+    pub fn apply_diagnostics(&mut self, data: &DiagnosticsData, mode: DiagnosticsMode) {
+        fn walk(n: &mut Node, data: &DiagnosticsData, min: Option<Severity>) {
+            n.diag = match min {
+                None => None,
+                Some(min) if n.is_dir() => data.worst_under(&n.path, min),
+                Some(min) => data.for_file(&n.path, min),
+            };
+            for c in &mut n.children {
+                walk(c, data, min);
+            }
+        }
+        walk(&mut self.root, data, mode.min_severity());
+    }
+
     /// Flatten the visible tree into rows.
     pub fn flatten(&self, opts: &ViewOptions) -> Vec<Row> {
         let mut out = Vec::new();
@@ -474,6 +494,7 @@ impl Tree {
             has_children,
             executable: node.executable,
             git: node.git,
+            diag: node.diag,
             link_to: node.link_to.clone(),
             group_target,
             ancestor_last: ancestor_last.clone(),

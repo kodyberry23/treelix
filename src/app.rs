@@ -25,8 +25,9 @@ use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
 use crate::clipboard::{ClipOp, Clipboard};
 use crate::config::Config;
+use crate::diagnostics::{self, DiagnosticsData};
 use crate::editor::{self, OpenMode};
-use crate::git::{self, GitData, GitStatus};
+use crate::git::{self, AfterScan, GitData, GitStatus, ScanSchedule};
 use crate::keymap::{self, Action};
 use crate::marks::Marks;
 use crate::render::{self, Decor, RenderOpts};
@@ -43,8 +44,10 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     Redraw,
     Fs(watcher::FsChange),
-    Git(GitData),
+    /// A status scan finished; `None` when it failed or timed out.
+    Git(Option<GitData>),
     Reveal(ipc::Reveal),
+    Diagnostics(ipc::DiagnosticsUpdate),
 }
 
 /// Result of one live-filter scan of the tree on disk.
@@ -91,6 +94,9 @@ pub struct App {
     overlay: Overlay,
     pending: String,
     git: GitData,
+    git_schedule: ScanSchedule,
+    diagnostics: DiagnosticsData,
+    diagnostics_mode: diagnostics::Mode,
     status: Option<String>,
     // When the transient status message should disappear on its own. Set
     // alongside `status` by set_status(); the event loop wakes at this
@@ -170,14 +176,18 @@ impl App {
             });
         }
 
-        // Reveal IPC socket → Reveal events.
-        let (rev_tx, rev_rx) = unbounded::<ipc::Reveal>();
-        let socket = ipc::serve(rev_tx);
+        // IPC socket → Reveal / Diagnostics events.
+        let (ipc_tx, ipc_rx) = unbounded::<ipc::Message>();
+        let socket = ipc::serve(ipc_tx);
         {
             let tx = tx.clone();
             thread::spawn(move || {
-                while let Ok(p) = rev_rx.recv() {
-                    if tx.send(AppEvent::Reveal(p)).is_err() {
+                while let Ok(message) = ipc_rx.recv() {
+                    let event = match message {
+                        ipc::Message::Reveal(reveal) => AppEvent::Reveal(reveal),
+                        ipc::Message::Diagnostics(update) => AppEvent::Diagnostics(update),
+                    };
+                    if tx.send(event).is_err() {
                         break;
                     }
                 }
@@ -197,6 +207,15 @@ impl App {
             overlay: Overlay::None,
             pending: String::new(),
             git: GitData::default(),
+            git_schedule: ScanSchedule::default(),
+            diagnostics: DiagnosticsData::default(),
+            diagnostics_mode: diagnostics::Mode::parse(&config.diagnostics).unwrap_or_else(|| {
+                eprintln!(
+                    "treelix: unknown diagnostics = \"{}\" (off | errors | warnings); using warnings",
+                    config.diagnostics
+                );
+                diagnostics::Mode::Warnings
+            }),
             status: None,
             status_deadline: None,
             should_quit: false,
@@ -346,14 +365,22 @@ impl App {
             // The OS dropped events (FSEvents "must scan subdirs"): the paths
             // we have are incomplete, so re-read every expanded directory.
             AppEvent::Fs(watcher::FsChange::Rescan) => self.reload_from_disk(),
-            AppEvent::Git(data) => {
+            AppEvent::Git(result) => {
+                match self.git_schedule.finished(result.is_some()) {
+                    AfterScan::Idle => {}
+                    AfterScan::Rerun => self.start_git_scan(Duration::ZERO),
+                    AfterScan::Retry(delay) => self.start_git_scan(delay),
+                }
+                let Some(data) = result else {
+                    return;
+                };
                 // Only invalidate the filter scan when the statuses actually
                 // changed. Every fs burst spawns a git scan; if it comes back
                 // identical (the common case), re-walking the whole tree for
                 // the filter is pure waste and doubles the per-burst cost.
                 let changed = self.git.statuses != data.statuses;
                 self.git = data;
-                self.tree.apply_git(&self.git);
+                self.apply_overlays();
                 if changed {
                     // The filter scan prunes on git-ignored status, so cached
                     // results computed against the old statuses are stale.
@@ -361,6 +388,19 @@ impl App {
                 }
                 if changed && self.live_filter.is_some() {
                     // Re-expand to any matches the new statuses revealed.
+                    self.refresh_filtered_view();
+                } else {
+                    self.refresh_rows(self.selected_path());
+                }
+            }
+            AppEvent::Diagnostics(ipc::DiagnosticsUpdate { path, counts }) => {
+                if self.diagnostics_mode == diagnostics::Mode::Off
+                    || !self.diagnostics.update(path, counts)
+                {
+                    return;
+                }
+                self.apply_overlays();
+                if self.live_filter.is_some() {
                     self.refresh_filtered_view();
                 } else {
                     self.refresh_rows(self.selected_path());
@@ -551,7 +591,7 @@ impl App {
                 // The user rearranged expansion wholesale; the filter no longer
                 // owns any of it, so it must not auto-collapse on clear.
                 self.filter_auto_expanded.clear();
-                self.tree.apply_git(&self.git);
+                self.apply_overlays();
                 self.refresh_rows(self.selected_path());
             }
             Action::CollapseAll => {
@@ -848,7 +888,7 @@ impl App {
             self.reveal_children = !row.expanded;
             self.tree.toggle(&row.path);
             self.note_user_expansion(&row.path);
-            self.tree.apply_git(&self.git);
+            self.apply_overlays();
             self.refresh_rows(Some(row.path));
         } else {
             editor::open(&row.path, OpenMode::Open, &self.config);
@@ -878,7 +918,7 @@ impl App {
             self.reveal_children = true;
             self.tree.expand(&row.path);
             self.note_user_expansion(&row.path);
-            self.tree.apply_git(&self.git);
+            self.apply_overlays();
             self.refresh_rows(Some(row.path));
         } else if row.kind.is_dir() {
             self.move_selection(1);
@@ -933,7 +973,7 @@ impl App {
         self.live_scan = None;
         self.filter_auto_expanded.clear();
         self.tree.set_root(path);
-        self.tree.apply_git(&self.git);
+        self.apply_overlays();
         self.refresh_rows(None);
         self.list_state.select(Some(0));
         self.spawn_git();
@@ -1332,7 +1372,7 @@ impl App {
             for p in self.tree.collect_expanded() {
                 self.tree.expand(&p);
             }
-            self.tree.apply_git(&self.git);
+            self.apply_overlays();
         }
         self.set_status(format!(
             "group empty dirs: {}",
@@ -1373,7 +1413,7 @@ impl App {
         // (the next toggle then inverts). The return value only decides whether
         // the cursor can move onto the revealed row.
         let landed = self.tree.reveal(&path);
-        self.tree.apply_git(&self.git);
+        self.apply_overlays();
         self.refresh_rows(None);
         if landed {
             self.select_path(&path);
@@ -1384,7 +1424,7 @@ impl App {
         let expanded = self.tree.collect_expanded();
         let sel = self.selected_path();
         self.tree.reload_preserving(&expanded);
-        self.tree.apply_git(&self.git);
+        self.apply_overlays();
         self.live_scan = None; // disk changed: cached filter matches are stale
         if self.live_filter.is_some() {
             self.refresh_filtered_view();
@@ -1426,27 +1466,44 @@ impl App {
             // Rebuild the filtered view and re-expand to any matches the change
             // surfaced (even inside a never-expanded directory the walk covers).
             if touched {
-                self.tree.apply_git(&self.git);
+                self.apply_overlays();
             }
             self.refresh_filtered_view();
         } else if touched {
-            self.tree.apply_git(&self.git);
+            self.apply_overlays();
             self.refresh_rows(sel);
         }
         self.spawn_git();
     }
 
-    fn spawn_git(&self) {
+    /// Ask for a status scan. One runs at a time (see `ScanSchedule`).
+    fn spawn_git(&mut self) {
+        if self.git_schedule.request() {
+            self.start_git_scan(Duration::ZERO);
+        }
+    }
+
+    fn start_git_scan(&self, delay: Duration) {
         let root = self.tree.root.path.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            // Only forward a successful scan. A failed/timed-out status
-            // returns None; forwarding an empty result would blank every glyph
-            // and, under the git-clean filter, empty the tree.
-            if let Some(data) = git::scan(&root) {
-                let _ = tx.send(AppEvent::Git(data));
+            if !delay.is_zero() {
+                thread::sleep(delay);
             }
+            // A failed/timed-out status is forwarded as None so the schedule
+            // can retry; the last good statuses stay on screen meanwhile
+            // (forwarding an empty result would blank every glyph and, under
+            // the git-clean filter, empty the tree).
+            let _ = tx.send(AppEvent::Git(git::scan(&root)));
         });
+    }
+
+    /// Re-apply every overlay (git status, diagnostics) to the tree after
+    /// either the tree or an overlay changed.
+    fn apply_overlays(&mut self) {
+        self.tree.apply_git(&self.git);
+        self.tree
+            .apply_diagnostics(&self.diagnostics, self.diagnostics_mode);
     }
 
     // ── Selection / rows ──────────────────────────────────────────────────────
@@ -1732,7 +1789,7 @@ impl App {
                 self.filter_auto_expanded.insert(dir.clone());
             }
             self.filter_expanding = false;
-            self.tree.apply_git(&self.git);
+            self.apply_overlays();
         }
         if truncated {
             self.set_status("filter: tree too large, results incomplete");
@@ -1774,7 +1831,7 @@ impl App {
         for dir in to_collapse {
             self.tree.collapse(&dir);
         }
-        self.tree.apply_git(&self.git);
+        self.apply_overlays();
     }
 
     /// Record that the user (not the filter) just toggled `path`'s expansion,
@@ -2261,6 +2318,115 @@ mod tests {
         let app = App::new(root.clone(), Config::default(), Theme::default());
         let deep = root.join("sub").join("deep.txt");
         (app, root, deep)
+    }
+
+    fn diag_of(app: &App, path: &Path) -> Option<crate::diagnostics::Diag> {
+        app.rows
+            .iter()
+            .find(|r| r.path == path)
+            .and_then(|r| r.diag)
+    }
+
+    #[test]
+    fn diagnostics_color_the_file_and_its_collapsed_folder_until_cleared() {
+        use crate::diagnostics::{Counts, Diag, Severity};
+        let (mut app, root, deep) = app_with_tree();
+        let sub = root.join("sub");
+        assert!(!deep_visible(&app, &deep), "sub starts collapsed");
+
+        app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+            path: deep.clone(),
+            counts: Counts {
+                errors: 2,
+                warnings: 1,
+            },
+        }));
+        assert_eq!(
+            diag_of(&app, &sub),
+            Some(Diag {
+                severity: Severity::Error,
+                count: 0
+            }),
+            "a collapsed folder shows the worst severity inside it"
+        );
+        assert_eq!(diag_of(&app, &root.join("a.txt")), None);
+
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: deep.clone(),
+            follow: false,
+        }));
+        assert_eq!(
+            diag_of(&app, &deep),
+            Some(Diag {
+                severity: Severity::Error,
+                count: 2
+            }),
+            "the file shows its error count once visible"
+        );
+
+        app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+            path: deep.clone(),
+            counts: Counts {
+                errors: 0,
+                warnings: 1,
+            },
+        }));
+        assert_eq!(
+            diag_of(&app, &deep).map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+        assert_eq!(
+            diag_of(&app, &sub).map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+
+        app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+            path: deep.clone(),
+            counts: Counts::default(),
+        }));
+        assert_eq!(diag_of(&app, &deep), None, "cleared");
+        assert_eq!(diag_of(&app, &sub), None);
+    }
+
+    #[test]
+    fn diagnostics_mode_errors_hides_warnings_and_off_ignores_everything() {
+        use crate::diagnostics::{Counts, Severity};
+        for (mode, expect_warning, expect_error) in
+            [("errors", None, Some(Severity::Error)), ("off", None, None)]
+        {
+            let root = fs::canonicalize(unique_tmpdir()).unwrap();
+            fs::write(root.join("a.txt"), b"x").unwrap();
+            let config = Config {
+                diagnostics: mode.to_string(),
+                ..Config::default()
+            };
+            let mut app = App::new(root.clone(), config, Theme::default());
+            let file = root.join("a.txt");
+            app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+                path: file.clone(),
+                counts: Counts {
+                    errors: 0,
+                    warnings: 4,
+                },
+            }));
+            assert_eq!(
+                diag_of(&app, &file).map(|d| d.severity),
+                expect_warning,
+                "{mode}"
+            );
+            app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+                path: file.clone(),
+                counts: Counts {
+                    errors: 1,
+                    warnings: 4,
+                },
+            }));
+            assert_eq!(
+                diag_of(&app, &file).map(|d| d.severity),
+                expect_error,
+                "{mode}"
+            );
+        }
     }
 
     /// Is `deep` an actual visible row (i.e. `sub` is expanded)?

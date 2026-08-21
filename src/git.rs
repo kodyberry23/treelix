@@ -13,6 +13,64 @@ use std::time::{Duration, Instant};
 /// round". Mirrors nvim-tree's timeout-and-kill (it uses 400ms; we allow more
 /// headroom since we re-scan less often).
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// A failed scan (timeout, git error) is retried this many times, with backoff.
+const MAX_RETRIES: u8 = 3;
+
+/// What to do once a scan finishes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AfterScan {
+    Idle,
+    /// A request arrived while the scan ran: scan again right away.
+    Rerun,
+    /// The scan failed: try again after this delay.
+    Retry(Duration),
+}
+
+/// Single-flight scheduling of status scans.
+///
+/// Every filesystem burst asks for a scan. Running them concurrently let a
+/// scan started mid-commit (reading the old index) finish after the one that
+/// saw the clean result and overwrite it, leaving a file yellow after a push.
+/// One scan runs at a time; a request that arrives meanwhile is served by one
+/// rerun when it finishes, so results always land in order and a burst costs
+/// at most two scans. A failed scan is retried a few times with backoff
+/// instead of leaving the last good statuses on screen indefinitely.
+#[derive(Debug, Default)]
+pub struct ScanSchedule {
+    running: bool,
+    rerun: bool,
+    failures: u8,
+}
+
+impl ScanSchedule {
+    /// A scan was requested. True when one must start now; otherwise the
+    /// request is remembered for when the current scan finishes.
+    pub fn request(&mut self) -> bool {
+        if self.running {
+            self.rerun = true;
+            false
+        } else {
+            self.running = true;
+            true
+        }
+    }
+
+    /// The running scan finished (`ok` = it produced statuses).
+    pub fn finished(&mut self, ok: bool) -> AfterScan {
+        self.running = false;
+        self.failures = if ok { 0 } else { self.failures + 1 };
+        if self.rerun {
+            self.rerun = false;
+            self.running = true;
+            return AfterScan::Rerun;
+        }
+        if !ok && self.failures <= MAX_RETRIES {
+            self.running = true;
+            return AfterScan::Retry(Duration::from_millis(500 * u64::from(self.failures)));
+        }
+        AfterScan::Idle
+    }
+}
 
 /// Run a command capturing stdout, killing it if it exceeds `timeout`. Returns
 /// the captured stdout on a successful exit, or `None` on failure/timeout.
@@ -375,5 +433,51 @@ mod tests {
         );
         assert_eq!(map.get(Path::new("/repo/other")), Some(&GitStatus::Dirty));
         assert!(!map.contains_key(Path::new("/repo/old.txt")));
+    }
+
+    #[test]
+    fn scans_run_one_at_a_time_and_a_request_meanwhile_reruns_once() {
+        let mut s = ScanSchedule::default();
+        assert!(s.request(), "idle: start now");
+        assert!(!s.request(), "running: remembered");
+        assert!(!s.request(), "running: still one rerun");
+        assert_eq!(s.finished(true), AfterScan::Rerun);
+        assert!(!s.request(), "the rerun is running");
+        assert_eq!(s.finished(true), AfterScan::Rerun);
+        assert_eq!(s.finished(true), AfterScan::Idle);
+        assert!(s.request(), "idle again");
+    }
+
+    #[test]
+    fn failed_scans_retry_with_backoff_then_give_up() {
+        let mut s = ScanSchedule::default();
+        assert!(s.request());
+        assert_eq!(
+            s.finished(false),
+            AfterScan::Retry(Duration::from_millis(500))
+        );
+        assert_eq!(
+            s.finished(false),
+            AfterScan::Retry(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            s.finished(false),
+            AfterScan::Retry(Duration::from_millis(1500))
+        );
+        assert_eq!(s.finished(false), AfterScan::Idle, "gave up");
+        assert!(s.request(), "a new request starts fresh");
+        assert_eq!(s.finished(true), AfterScan::Idle);
+        assert!(s.request());
+        assert_eq!(
+            s.finished(false),
+            AfterScan::Retry(Duration::from_millis(500)),
+            "success reset the count"
+        );
+        assert!(!s.request(), "a request during a retry wait is a rerun");
+        assert_eq!(
+            s.finished(false),
+            AfterScan::Rerun,
+            "the rerun beats another retry"
+        );
     }
 }

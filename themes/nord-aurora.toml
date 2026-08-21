@@ -43,6 +43,10 @@ git_renamed   = "yellow"
 git_conflict  = "red"
 git_untracked = "orange"
 git_ignored   = "polar3"
+# LSP diagnostics pushed by Helix: file names (and their folders) by the
+# worst severity present. These win over the git colors above.
+diagnostic_error   = "red"
+diagnostic_warning = "yellow"
 cut           = "red / none / italic"
 copy          = "yellow"
 special       = "yellow / none / bold"

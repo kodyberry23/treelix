@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::diagnostics::Severity;
 use crate::git::GitStatus;
 
 /// The built-in default theme, embedded so treelix looks right with zero config.
@@ -32,6 +33,8 @@ pub struct Theme {
     pub git_conflict: Style,
     pub git_untracked: Style,
     pub git_ignored: Style,
+    pub diagnostic_error: Style,
+    pub diagnostic_warning: Style,
     pub cut: Style,
     pub copy: Style,
     pub special: Style,
@@ -60,6 +63,13 @@ impl Theme {
             GitStatus::Conflict => self.git_conflict,
             GitStatus::Untracked => self.git_untracked,
             GitStatus::Ignored => self.git_ignored,
+        }
+    }
+
+    pub fn diagnostic_style(&self, severity: Severity) -> Style {
+        match severity {
+            Severity::Error => self.diagnostic_error,
+            Severity::Warning => self.diagnostic_warning,
         }
     }
 
@@ -122,6 +132,8 @@ impl Theme {
             git_conflict: get("git_conflict", text),
             git_untracked: get("git_untracked", text),
             git_ignored: get("git_ignored", text),
+            diagnostic_error: get("diagnostic_error", text),
+            diagnostic_warning: get("diagnostic_warning", text),
             cut: get("cut", text),
             copy: get("copy", text),
             special: get("special", text),

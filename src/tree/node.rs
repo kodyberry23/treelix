@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::diagnostics::Diag;
 use crate::git::GitStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,8 @@ pub struct Node {
     pub executable: bool,
     /// Per-file status, or propagated highest-priority status for directories.
     pub git: Option<GitStatus>,
+    /// LSP diagnostics pushed by the editor (see `diagnostics.rs`).
+    pub diag: Option<Diag>,
     /// Symlink destination, for display.
     pub link_to: Option<PathBuf>,
     /// File size in bytes (0 for directories).
@@ -66,6 +69,7 @@ impl Node {
             children: Vec::new(),
             executable,
             git: None,
+            diag: None,
             link_to,
             len: 0,
             mtime: None,

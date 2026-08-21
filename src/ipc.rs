@@ -7,6 +7,11 @@
 //!   `reveal-follow <abspath>` — automatic push from the patched Helix on a
 //!                               focused-buffer change; the app may defer it
 //!                               while the user is driving the tree.
+//!   `diagnostics <errors> <warnings> <abspath>`
+//!                             — the file's current LSP diagnostic counts, pushed
+//!                               by the patched Helix whenever they change; both
+//!                               zero clears the file. Counts come first so the
+//!                               path can contain spaces.
 //! The path is taken verbatim up to the newline (no trimming — trailing
 //! whitespace is legal in file names).
 
@@ -17,6 +22,7 @@ use std::thread;
 
 use crossbeam_channel::Sender;
 
+use crate::diagnostics::Counts;
 use crate::editor;
 
 /// One parsed reveal command.
@@ -25,6 +31,19 @@ pub struct Reveal {
     /// True for `reveal-follow` (automatic push), false for an explicit
     /// user-requested reveal.
     pub follow: bool,
+}
+
+/// A file's diagnostic counts as reported by the editor.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DiagnosticsUpdate {
+    pub path: PathBuf,
+    pub counts: Counts,
+}
+
+/// One parsed wire line.
+pub enum Message {
+    Reveal(Reveal),
+    Diagnostics(DiagnosticsUpdate),
 }
 
 /// Resolve the per-session reveal socket path, matching the dotfiles'
@@ -76,7 +95,7 @@ fn socket_identity(_path: &Path) -> Option<(u64, u64)> {
 /// reveal line is forwarded on `sender`. Returns a guard that cleans up the
 /// socket file on drop (and `None` if binding failed or another live
 /// instance already owns the socket).
-pub fn serve(sender: Sender<Reveal>) -> Option<SocketGuard> {
+pub fn serve(sender: Sender<Message>) -> Option<SocketGuard> {
     let path = socket_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -122,30 +141,46 @@ pub fn serve(sender: Sender<Reveal>) -> Option<SocketGuard> {
     Some(SocketGuard { path, identity })
 }
 
-fn handle(stream: UnixStream, sender: &Sender<Reveal>) {
+fn handle(stream: UnixStream, sender: &Sender<Message>) {
     // Bound the read so a peer that connects and then stalls (never sending a
     // newline, never closing) frees this thread instead of leaking it.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let reader = BufReader::new(stream);
     for line in reader.lines().map_while(Result::ok) {
-        if let Some(reveal) = parse_line(&line) {
-            let _ = sender.send(reveal);
+        if let Some(message) = parse_line(&line) {
+            let _ = sender.send(message);
         }
     }
 }
 
-/// Parse one wire line. The path is everything after the command word,
-/// verbatim — `lines()` has already removed the newline terminator, and
-/// trailing whitespace is a legal part of a file name.
-fn parse_line(line: &str) -> Option<Reveal> {
+/// Parse one wire line. The path is everything after the command word (and,
+/// for `diagnostics`, the two counts), verbatim — `lines()` has already
+/// removed the newline terminator, and trailing whitespace is a legal part of
+/// a file name. Unknown commands are ignored, so an older treelix paired with
+/// a newer Helix just misses the feature.
+fn parse_line(line: &str) -> Option<Message> {
+    if let Some(rest) = line.strip_prefix("diagnostics ") {
+        let mut parts = rest.splitn(3, ' ');
+        let errors = parts.next()?.parse().ok()?;
+        let warnings = parts.next()?.parse().ok()?;
+        let path = parts.next()?;
+        return (!path.is_empty()).then(|| {
+            Message::Diagnostics(DiagnosticsUpdate {
+                path: PathBuf::from(path),
+                counts: Counts { errors, warnings },
+            })
+        });
+    }
     let (rest, follow) = if let Some(rest) = line.strip_prefix("reveal-follow ") {
         (rest, true)
     } else {
         (line.strip_prefix("reveal ")?, false)
     };
-    (!rest.is_empty()).then(|| Reveal {
-        path: PathBuf::from(rest),
-        follow,
+    (!rest.is_empty()).then(|| {
+        Message::Reveal(Reveal {
+            path: PathBuf::from(rest),
+            follow,
+        })
     })
 }
 
@@ -188,11 +223,15 @@ mod tests {
 
     #[test]
     fn parse_explicit_and_follow() {
-        let r = parse_line("reveal /a/b.txt").unwrap();
+        let Message::Reveal(r) = parse_line("reveal /a/b.txt").unwrap() else {
+            panic!("expected a reveal");
+        };
         assert_eq!(r.path, PathBuf::from("/a/b.txt"));
         assert!(!r.follow);
 
-        let r = parse_line("reveal-follow /a/b.txt").unwrap();
+        let Message::Reveal(r) = parse_line("reveal-follow /a/b.txt").unwrap() else {
+            panic!("expected a reveal");
+        };
         assert_eq!(r.path, PathBuf::from("/a/b.txt"));
         assert!(r.follow);
     }
@@ -200,10 +239,14 @@ mod tests {
     #[test]
     fn parse_preserves_path_whitespace() {
         // Trailing whitespace is a legal part of a unix file name.
-        let r = parse_line("reveal /a/trailing ").unwrap();
+        let Message::Reveal(r) = parse_line("reveal /a/trailing ").unwrap() else {
+            panic!("expected a reveal");
+        };
         assert_eq!(r.path, PathBuf::from("/a/trailing "));
         // Interior spaces too.
-        let r = parse_line("reveal-follow /a/has space/f.txt").unwrap();
+        let Message::Reveal(r) = parse_line("reveal-follow /a/has space/f.txt").unwrap() else {
+            panic!("expected a reveal");
+        };
         assert_eq!(r.path, PathBuf::from("/a/has space/f.txt"));
     }
 
@@ -215,5 +258,39 @@ mod tests {
         assert!(parse_line("reveal-follow ").is_none());
         assert!(parse_line("revealx /a").is_none());
         assert!(parse_line("open /a").is_none());
+    }
+
+    #[test]
+    fn parses_diagnostics_with_counts_first_and_verbatim_path() {
+        let Message::Diagnostics(d) = parse_line("diagnostics 2 5 /a/has space/f.rs ").unwrap()
+        else {
+            panic!("expected diagnostics");
+        };
+        assert_eq!(d.path, PathBuf::from("/a/has space/f.rs "));
+        assert_eq!(
+            d.counts,
+            Counts {
+                errors: 2,
+                warnings: 5
+            }
+        );
+        let Message::Diagnostics(d) = parse_line("diagnostics 0 0 /a/f.rs").unwrap() else {
+            panic!("expected diagnostics");
+        };
+        assert!(d.counts.is_empty(), "both zero clears the file");
+        assert!(
+            parse_line("diagnostics 1 /a/f.rs").is_none(),
+            "missing a count"
+        );
+        assert!(
+            parse_line("diagnostics x 1 /a/f.rs").is_none(),
+            "not a number"
+        );
+        assert!(parse_line("diagnostics 1 1 ").is_none(), "empty path");
+        assert!(parse_line("diagnostics 1 1").is_none());
+        assert!(
+            parse_line("unknown-command /a").is_none(),
+            "ignored, not an error"
+        );
     }
 }

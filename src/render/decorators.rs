@@ -63,6 +63,14 @@ pub fn name_style(row: &Row, theme: &Theme, decor: &Decor) -> Style {
         style = style.patch(theme.selected);
     }
 
+    // A problem in the file outranks everything above, including the git
+    // state and the "opened in the editor" color: it is what the user must
+    // not miss. The git glyph after the name still shows the git state, and
+    // the opened/selected modifiers (bold, background) still apply.
+    if let Some(diag) = row.diag {
+        style = style.patch(theme.diagnostic_style(diag.severity));
+    }
+
     if row.name.starts_with('.') {
         style = style.add_modifier(Modifier::DIM);
     }

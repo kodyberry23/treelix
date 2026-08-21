@@ -22,6 +22,9 @@ pub struct Config {
     pub show_hidden: bool,
     /// Show git-ignored files by default.
     pub show_ignored: bool,
+    /// Which LSP diagnostics (pushed by the patched Helix) color file names:
+    /// "warnings" (errors and warnings, the default), "errors", or "off".
+    pub diagnostics: String,
     /// Sort mode: name | modified | extension | filetype.
     pub sort: String,
     /// Place files before directories.
@@ -62,6 +65,7 @@ impl Default for Config {
             indent_markers: false,
             show_hidden: false,
             show_ignored: false,
+            diagnostics: "warnings".to_string(),
             sort: "name".to_string(),
             files_first: false,
             group_empty: false,
