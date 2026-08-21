@@ -44,10 +44,18 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     Redraw,
     Fs(watcher::FsChange),
-    /// A status scan finished; `None` when it failed or timed out.
-    Git(Option<GitData>),
+    /// Status scan `id` finished; `None` when it failed or timed out.
+    Git {
+        id: u64,
+        result: Option<GitData>,
+    },
     Reveal(ipc::Reveal),
     Diagnostics(ipc::DiagnosticsUpdate),
+    /// A complete set of diagnostics; `seq` orders snapshots from one sender.
+    DiagnosticsSnapshot {
+        seq: u64,
+        files: Vec<(PathBuf, diagnostics::Counts)>,
+    },
 }
 
 /// Result of one live-filter scan of the tree on disk.
@@ -97,6 +105,8 @@ pub struct App {
     git_schedule: ScanSchedule,
     diagnostics: DiagnosticsData,
     diagnostics_mode: diagnostics::Mode,
+    /// Sequence of the last snapshot applied; older ones are ignored.
+    diagnostics_seq: u64,
     status: Option<String>,
     // When the transient status message should disappear on its own. Set
     // alongside `status` by set_status(); the event loop wakes at this
@@ -186,6 +196,9 @@ impl App {
                     let event = match message {
                         ipc::Message::Reveal(reveal) => AppEvent::Reveal(reveal),
                         ipc::Message::Diagnostics(update) => AppEvent::Diagnostics(update),
+                        ipc::Message::DiagnosticsSnapshot { seq, files } => {
+                            AppEvent::DiagnosticsSnapshot { seq, files }
+                        }
                     };
                     if tx.send(event).is_err() {
                         break;
@@ -209,6 +222,7 @@ impl App {
             git: GitData::default(),
             git_schedule: ScanSchedule::default(),
             diagnostics: DiagnosticsData::default(),
+            diagnostics_seq: 0,
             diagnostics_mode: diagnostics::Mode::parse(&config.diagnostics).unwrap_or_else(|| {
                 eprintln!(
                     "treelix: unknown diagnostics = \"{}\" (off | errors | warnings); using warnings",
@@ -365,11 +379,15 @@ impl App {
             // The OS dropped events (FSEvents "must scan subdirs"): the paths
             // we have are incomplete, so re-read every expanded directory.
             AppEvent::Fs(watcher::FsChange::Rescan) => self.reload_from_disk(),
-            AppEvent::Git(result) => {
-                match self.git_schedule.finished(result.is_some()) {
+            AppEvent::Git { id, result } => {
+                match self
+                    .git_schedule
+                    .finished(id, result.is_some(), Instant::now())
+                {
                     AfterScan::Idle => {}
-                    AfterScan::Rerun => self.start_git_scan(Duration::ZERO),
-                    AfterScan::Retry(delay) => self.start_git_scan(delay),
+                    AfterScan::Stale => return,
+                    AfterScan::Rerun(next) => self.start_git_scan(next, Duration::ZERO),
+                    AfterScan::Retry(next, delay) => self.start_git_scan(next, delay),
                 }
                 let Some(data) = result else {
                     return;
@@ -394,16 +412,26 @@ impl App {
                 }
             }
             AppEvent::Diagnostics(ipc::DiagnosticsUpdate { path, counts }) => {
-                if self.diagnostics_mode == diagnostics::Mode::Off
-                    || !self.diagnostics.update(path, counts)
-                {
+                if self.diagnostics_mode == diagnostics::Mode::Off {
                     return;
                 }
-                self.apply_overlays();
-                if self.live_filter.is_some() {
-                    self.refresh_filtered_view();
-                } else {
-                    self.refresh_rows(self.selected_path());
+                // Tree nodes are keyed by canonical paths (see the Reveal arm);
+                // the editor sends lexically normalized ones.
+                let path = canonicalize_lenient(&path);
+                if self.diagnostics.update(path, counts) {
+                    self.diagnostics_changed();
+                }
+            }
+            AppEvent::DiagnosticsSnapshot { seq, files } => {
+                if self.diagnostics_mode == diagnostics::Mode::Off || seq <= self.diagnostics_seq {
+                    return;
+                }
+                self.diagnostics_seq = seq;
+                let files = files
+                    .into_iter()
+                    .map(|(path, counts)| (canonicalize_lenient(&path), counts));
+                if self.diagnostics.replace(files) {
+                    self.diagnostics_changed();
                 }
             }
             AppEvent::Reveal(ipc::Reveal { path, follow }) => {
@@ -1478,12 +1506,12 @@ impl App {
 
     /// Ask for a status scan. One runs at a time (see `ScanSchedule`).
     fn spawn_git(&mut self) {
-        if self.git_schedule.request() {
-            self.start_git_scan(Duration::ZERO);
+        if let Some(id) = self.git_schedule.request(Instant::now()) {
+            self.start_git_scan(id, Duration::ZERO);
         }
     }
 
-    fn start_git_scan(&self, delay: Duration) {
+    fn start_git_scan(&self, id: u64, delay: Duration) {
         let root = self.tree.root.path.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -1494,8 +1522,21 @@ impl App {
             // can retry; the last good statuses stay on screen meanwhile
             // (forwarding an empty result would blank every glyph and, under
             // the git-clean filter, empty the tree).
-            let _ = tx.send(AppEvent::Git(git::scan(&root)));
+            let _ = tx.send(AppEvent::Git {
+                id,
+                result: git::scan(&root),
+            });
         });
+    }
+
+    /// The diagnostics set changed: recolor and redraw.
+    fn diagnostics_changed(&mut self) {
+        self.apply_overlays();
+        if self.live_filter.is_some() {
+            self.refresh_filtered_view();
+        } else {
+            self.refresh_rows(self.selected_path());
+        }
     }
 
     /// Re-apply every overlay (git status, diagnostics) to the tree after
@@ -2386,6 +2427,66 @@ mod tests {
         }));
         assert_eq!(diag_of(&app, &deep), None, "cleared");
         assert_eq!(diag_of(&app, &sub), None);
+    }
+
+    #[test]
+    fn snapshots_replace_everything_and_older_ones_are_ignored() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, deep) = app_with_tree();
+        let a = root.join("a.txt");
+        let counts = |e, w| Counts {
+            errors: e,
+            warnings: w,
+        };
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            seq: 2,
+            files: vec![(a.clone(), counts(1, 0)), (deep.clone(), counts(0, 1))],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        assert_eq!(
+            diag_of(&app, &root.join("sub")).map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+        // An older snapshot (a connection handled late) changes nothing.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            seq: 1,
+            files: vec![(a.clone(), counts(0, 0))],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        // A newer one that omits a file clears it.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            seq: 3,
+            files: vec![(deep.clone(), counts(0, 1))],
+        });
+        assert_eq!(diag_of(&app, &a), None);
+        assert_eq!(
+            diag_of(&app, &root.join("sub")).map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_paths_through_a_symlink_reach_the_canonical_node() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, deep) = app_with_tree();
+        let links = unique_tmpdir();
+        let link = links.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let via_link = link.join("sub").join("deep.txt");
+        assert_ne!(via_link, deep);
+        app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+            path: via_link,
+            counts: Counts {
+                errors: 1,
+                warnings: 0,
+            },
+        }));
+        assert_eq!(
+            diag_of(&app, &root.join("sub")).map(|d| d.severity),
+            Some(Severity::Error),
+            "the symlinked path was canonicalized onto the tree's node"
+        );
     }
 
     #[test]

@@ -132,8 +132,11 @@ impl Theme {
             git_conflict: get("git_conflict", text),
             git_untracked: get("git_untracked", text),
             git_ignored: get("git_ignored", text),
-            diagnostic_error: get("diagnostic_error", text),
-            diagnostic_warning: get("diagnostic_warning", text),
+            // Themes written before these keys existed must still show
+            // diagnostics, and in a diagnostic color rather than `text`
+            // (which would override the git color for nothing).
+            diagnostic_error: get("diagnostic_error", Style::default().fg(Color::Red)),
+            diagnostic_warning: get("diagnostic_warning", Style::default().fg(Color::Yellow)),
             cut: get("cut", text),
             copy: get("copy", text),
             special: get("special", text),
@@ -307,6 +310,8 @@ pub mod helix {
         theme.git_conflict = theme.git_deleted;
         theme.git_untracked = style_of(scope_fg("special"), theme.git_untracked);
         theme.git_ignored = style_of(scope_fg("comment"), theme.git_ignored);
+        theme.diagnostic_error = style_of(scope_fg("error"), theme.diagnostic_error);
+        theme.diagnostic_warning = style_of(scope_fg("warning"), theme.diagnostic_warning);
         theme.special = style_of(scope_fg("constant"), theme.special).add_modifier(Modifier::BOLD);
         theme.opened =
             style_of(scope_fg("ui.text.focus"), theme.opened).add_modifier(Modifier::BOLD);

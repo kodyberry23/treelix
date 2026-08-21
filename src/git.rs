@@ -15,15 +15,22 @@ use std::time::{Duration, Instant};
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// A failed scan (timeout, git error) is retried this many times, with backoff.
 const MAX_RETRIES: u8 = 3;
+/// A scan that has not reported after this long is presumed hung (its git
+/// subprocess was killed at GIT_TIMEOUT, but a helper it spawned may hold the
+/// pipe); the next request starts a fresh one and the late result, if it ever
+/// comes, is ignored by id.
+const SCAN_STALL: Duration = Duration::from_secs(15);
 
 /// What to do once a scan finishes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AfterScan {
     Idle,
     /// A request arrived while the scan ran: scan again right away.
-    Rerun,
+    Rerun(u64),
     /// The scan failed: try again after this delay.
-    Retry(Duration),
+    Retry(u64, Duration),
+    /// Not the scan that is running (superseded after a stall): ignore it.
+    Stale,
 }
 
 /// Single-flight scheduling of status scans.
@@ -34,46 +41,71 @@ pub enum AfterScan {
 /// One scan runs at a time; a request that arrives meanwhile is served by one
 /// rerun when it finishes, so results always land in order and a burst costs
 /// at most two scans. A failed scan is retried a few times with backoff
-/// instead of leaving the last good statuses on screen indefinitely.
+/// instead of leaving the last good statuses on screen indefinitely, and a
+/// scan that never reports is abandoned after `SCAN_STALL`.
 #[derive(Debug, Default)]
 pub struct ScanSchedule {
-    running: bool,
+    /// The running scan's id and when it started
+    running: Option<(u64, Instant)>,
     rerun: bool,
     failures: u8,
+    last_id: u64,
 }
 
 impl ScanSchedule {
-    /// A scan was requested. True when one must start now; otherwise the
-    /// request is remembered for when the current scan finishes.
-    pub fn request(&mut self) -> bool {
-        if self.running {
-            self.rerun = true;
-            false
-        } else {
-            self.running = true;
-            true
+    fn start(&mut self, now: Instant) -> u64 {
+        self.last_id += 1;
+        self.running = Some((self.last_id, now));
+        self.last_id
+    }
+
+    /// A scan was requested. Returns the id of the scan to start now, or
+    /// `None` when one is running: the request is then remembered for when it
+    /// finishes.
+    pub fn request(&mut self, now: Instant) -> Option<u64> {
+        match self.running {
+            Some((_, started)) if now.duration_since(started) < SCAN_STALL => {
+                self.rerun = true;
+                None
+            }
+            // Hung: abandon it. Its result, if any, will not match the new id,
+            // and the fresh scan serves any request remembered meanwhile.
+            Some(_) => {
+                self.rerun = false;
+                Some(self.start(now))
+            }
+            None => {
+                // A fresh request after the retries gave up starts clean.
+                self.failures = 0;
+                Some(self.start(now))
+            }
         }
     }
 
-    /// The running scan finished (`ok` = it produced statuses).
-    pub fn finished(&mut self, ok: bool) -> AfterScan {
-        self.running = false;
-        self.failures = if ok { 0 } else { self.failures + 1 };
+    /// Scan `id` finished (`ok` = it produced statuses).
+    pub fn finished(&mut self, id: u64, ok: bool, now: Instant) -> AfterScan {
+        match self.running {
+            Some((running, _)) if running == id => {}
+            _ => return AfterScan::Stale,
+        }
+        self.running = None;
+        self.failures = if ok {
+            0
+        } else {
+            self.failures.saturating_add(1)
+        };
         if self.rerun {
             self.rerun = false;
-            self.running = true;
-            return AfterScan::Rerun;
+            return AfterScan::Rerun(self.start(now));
         }
         if !ok && self.failures <= MAX_RETRIES {
-            self.running = true;
-            return AfterScan::Retry(Duration::from_millis(500 * u64::from(self.failures)));
+            let delay = Duration::from_millis(500 * u64::from(self.failures));
+            return AfterScan::Retry(self.start(now), delay);
         }
         AfterScan::Idle
     }
 }
 
-/// Run a command capturing stdout, killing it if it exceeds `timeout`. Returns
-/// the captured stdout on a successful exit, or `None` on failure/timeout.
 fn run_capture(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -180,16 +212,14 @@ pub struct GitData {
 
 /// Discover the git top-level for `root`, or `None` if not a repo.
 pub fn toplevel(root: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(root)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
+        .args(["rev-parse", "--show-toplevel"]);
+    // Bounded like the status scan itself: a hung git here would hold the
+    // single-flight schedule.
+    let out = run_capture(cmd, GIT_TIMEOUT)?;
+    let s = String::from_utf8_lossy(&out);
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -437,47 +467,67 @@ mod tests {
 
     #[test]
     fn scans_run_one_at_a_time_and_a_request_meanwhile_reruns_once() {
+        let t0 = Instant::now();
         let mut s = ScanSchedule::default();
-        assert!(s.request(), "idle: start now");
-        assert!(!s.request(), "running: remembered");
-        assert!(!s.request(), "running: still one rerun");
-        assert_eq!(s.finished(true), AfterScan::Rerun);
-        assert!(!s.request(), "the rerun is running");
-        assert_eq!(s.finished(true), AfterScan::Rerun);
-        assert_eq!(s.finished(true), AfterScan::Idle);
-        assert!(s.request(), "idle again");
+        let first = s.request(t0).expect("idle: start now");
+        assert!(s.request(t0).is_none(), "running: remembered");
+        assert!(s.request(t0).is_none(), "running: still one rerun");
+        let AfterScan::Rerun(second) = s.finished(first, true, t0) else {
+            panic!("expected a rerun");
+        };
+        assert_ne!(first, second);
+        assert_eq!(
+            s.finished(first, true, t0),
+            AfterScan::Stale,
+            "old id ignored"
+        );
+        assert!(s.request(t0).is_none(), "the rerun is running");
+        let AfterScan::Rerun(third) = s.finished(second, true, t0) else {
+            panic!("expected a rerun");
+        };
+        assert_eq!(s.finished(third, true, t0), AfterScan::Idle);
+        assert!(s.request(t0).is_some(), "idle again");
     }
 
     #[test]
-    fn failed_scans_retry_with_backoff_then_give_up() {
+    fn failed_scans_retry_with_backoff_then_give_up_and_a_new_request_starts_clean() {
+        let t0 = Instant::now();
         let mut s = ScanSchedule::default();
-        assert!(s.request());
-        assert_eq!(
-            s.finished(false),
-            AfterScan::Retry(Duration::from_millis(500))
+        let id = s.request(t0).unwrap();
+        let AfterScan::Retry(id, d) = s.finished(id, false, t0) else {
+            panic!()
+        };
+        assert_eq!(d, Duration::from_millis(500));
+        let AfterScan::Retry(id, d) = s.finished(id, false, t0) else {
+            panic!()
+        };
+        assert_eq!(d, Duration::from_millis(1000));
+        let AfterScan::Retry(id, d) = s.finished(id, false, t0) else {
+            panic!()
+        };
+        assert_eq!(d, Duration::from_millis(1500));
+        assert_eq!(s.finished(id, false, t0), AfterScan::Idle, "gave up");
+        let id = s.request(t0).expect("a new request starts fresh");
+        assert!(
+            matches!(s.finished(id, false, t0), AfterScan::Retry(_, d) if d == Duration::from_millis(500)),
+            "the failure count was reset by the fresh request"
         );
-        assert_eq!(
-            s.finished(false),
-            AfterScan::Retry(Duration::from_millis(1000))
+    }
+
+    #[test]
+    fn a_hung_scan_is_abandoned_and_its_late_result_ignored() {
+        let t0 = Instant::now();
+        let mut s = ScanSchedule::default();
+        let hung = s.request(t0).unwrap();
+        assert!(
+            s.request(t0 + Duration::from_secs(5)).is_none(),
+            "still waiting"
         );
-        assert_eq!(
-            s.finished(false),
-            AfterScan::Retry(Duration::from_millis(1500))
-        );
-        assert_eq!(s.finished(false), AfterScan::Idle, "gave up");
-        assert!(s.request(), "a new request starts fresh");
-        assert_eq!(s.finished(true), AfterScan::Idle);
-        assert!(s.request());
-        assert_eq!(
-            s.finished(false),
-            AfterScan::Retry(Duration::from_millis(500)),
-            "success reset the count"
-        );
-        assert!(!s.request(), "a request during a retry wait is a rerun");
-        assert_eq!(
-            s.finished(false),
-            AfterScan::Rerun,
-            "the rerun beats another retry"
-        );
+        let fresh = s
+            .request(t0 + SCAN_STALL + Duration::from_secs(1))
+            .expect("overdue: start a fresh scan");
+        assert_ne!(hung, fresh);
+        assert_eq!(s.finished(hung, true, t0), AfterScan::Stale);
+        assert_eq!(s.finished(fresh, true, t0), AfterScan::Idle);
     }
 }

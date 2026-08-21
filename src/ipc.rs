@@ -8,10 +8,18 @@
 //!                               focused-buffer change; the app may defer it
 //!                               while the user is driving the tree.
 //!   `diagnostics <errors> <warnings> <abspath>`
-//!                             — the file's current LSP diagnostic counts, pushed
-//!                               by the patched Helix whenever they change; both
+//!                             — one file's current LSP diagnostic counts; both
 //!                               zero clears the file. Counts come first so the
 //!                               path can contain spaces.
+//!   `diagnostics-begin <seq>` … `diagnostics-end <seq>`
+//!                             — a complete snapshot: the `diagnostics` lines in
+//!                               between are every file that has any, applied
+//!                               atomically at `end`; files not listed are
+//!                               clear. `seq` grows with each snapshot the
+//!                               sender produces, and a snapshot older than the
+//!                               one applied is ignored, so connections
+//!                               handled out of order cannot leave stale
+//!                               colors. This is what the patched Helix sends.
 //! The path is taken verbatim up to the newline (no trimming — trailing
 //! whitespace is legal in file names).
 
@@ -26,6 +34,7 @@ use crate::diagnostics::Counts;
 use crate::editor;
 
 /// One parsed reveal command.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Reveal {
     pub path: PathBuf,
     /// True for `reveal-follow` (automatic push), false for an explicit
@@ -40,10 +49,53 @@ pub struct DiagnosticsUpdate {
     pub counts: Counts,
 }
 
-/// One parsed wire line.
+/// One message for the app: a wire line, or a whole snapshot batch.
 pub enum Message {
     Reveal(Reveal),
     Diagnostics(DiagnosticsUpdate),
+    DiagnosticsSnapshot {
+        seq: u64,
+        files: Vec<(PathBuf, Counts)>,
+    },
+}
+
+/// One parsed wire line.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    Reveal(Reveal),
+    Diagnostics(DiagnosticsUpdate),
+    Begin(u64),
+    End(u64),
+}
+
+/// Lines of a snapshot batch being read on one connection.
+type Batch = Option<(u64, Vec<(PathBuf, Counts)>)>;
+
+/// Fold one line into the connection's batch state; returns the message to
+/// deliver, if the line completes one. A `diagnostics` line outside a batch
+/// is delivered on its own; inside, it joins the batch. A batch is delivered
+/// only when its `end` carries the same sequence as its `begin`.
+fn fold_line(batch: &mut Batch, line: Line) -> Option<Message> {
+    match line {
+        Line::Reveal(reveal) => Some(Message::Reveal(reveal)),
+        Line::Begin(seq) => {
+            *batch = Some((seq, Vec::new()));
+            None
+        }
+        Line::Diagnostics(update) => match batch {
+            Some((_, files)) => {
+                files.push((update.path, update.counts));
+                None
+            }
+            None => Some(Message::Diagnostics(update)),
+        },
+        Line::End(seq) => match batch.take() {
+            Some((begun, files)) if begun == seq => {
+                Some(Message::DiagnosticsSnapshot { seq, files })
+            }
+            _ => None,
+        },
+    }
 }
 
 /// Resolve the per-session reveal socket path, matching the dotfiles'
@@ -146,8 +198,9 @@ fn handle(stream: UnixStream, sender: &Sender<Message>) {
     // newline, never closing) frees this thread instead of leaking it.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let reader = BufReader::new(stream);
+    let mut batch: Batch = None;
     for line in reader.lines().map_while(Result::ok) {
-        if let Some(message) = parse_line(&line) {
+        if let Some(message) = parse_line(&line).and_then(|line| fold_line(&mut batch, line)) {
             let _ = sender.send(message);
         }
     }
@@ -158,14 +211,20 @@ fn handle(stream: UnixStream, sender: &Sender<Message>) {
 /// removed the newline terminator, and trailing whitespace is a legal part of
 /// a file name. Unknown commands are ignored, so an older treelix paired with
 /// a newer Helix just misses the feature.
-fn parse_line(line: &str) -> Option<Message> {
+fn parse_line(line: &str) -> Option<Line> {
+    if let Some(seq) = line.strip_prefix("diagnostics-begin ") {
+        return seq.parse().ok().map(Line::Begin);
+    }
+    if let Some(seq) = line.strip_prefix("diagnostics-end ") {
+        return seq.parse().ok().map(Line::End);
+    }
     if let Some(rest) = line.strip_prefix("diagnostics ") {
         let mut parts = rest.splitn(3, ' ');
         let errors = parts.next()?.parse().ok()?;
         let warnings = parts.next()?.parse().ok()?;
         let path = parts.next()?;
         return (!path.is_empty()).then(|| {
-            Message::Diagnostics(DiagnosticsUpdate {
+            Line::Diagnostics(DiagnosticsUpdate {
                 path: PathBuf::from(path),
                 counts: Counts { errors, warnings },
             })
@@ -177,7 +236,7 @@ fn parse_line(line: &str) -> Option<Message> {
         (line.strip_prefix("reveal ")?, false)
     };
     (!rest.is_empty()).then(|| {
-        Message::Reveal(Reveal {
+        Line::Reveal(Reveal {
             path: PathBuf::from(rest),
             follow,
         })
@@ -223,13 +282,13 @@ mod tests {
 
     #[test]
     fn parse_explicit_and_follow() {
-        let Message::Reveal(r) = parse_line("reveal /a/b.txt").unwrap() else {
+        let Line::Reveal(r) = parse_line("reveal /a/b.txt").unwrap() else {
             panic!("expected a reveal");
         };
         assert_eq!(r.path, PathBuf::from("/a/b.txt"));
         assert!(!r.follow);
 
-        let Message::Reveal(r) = parse_line("reveal-follow /a/b.txt").unwrap() else {
+        let Line::Reveal(r) = parse_line("reveal-follow /a/b.txt").unwrap() else {
             panic!("expected a reveal");
         };
         assert_eq!(r.path, PathBuf::from("/a/b.txt"));
@@ -239,12 +298,12 @@ mod tests {
     #[test]
     fn parse_preserves_path_whitespace() {
         // Trailing whitespace is a legal part of a unix file name.
-        let Message::Reveal(r) = parse_line("reveal /a/trailing ").unwrap() else {
+        let Line::Reveal(r) = parse_line("reveal /a/trailing ").unwrap() else {
             panic!("expected a reveal");
         };
         assert_eq!(r.path, PathBuf::from("/a/trailing "));
         // Interior spaces too.
-        let Message::Reveal(r) = parse_line("reveal-follow /a/has space/f.txt").unwrap() else {
+        let Line::Reveal(r) = parse_line("reveal-follow /a/has space/f.txt").unwrap() else {
             panic!("expected a reveal");
         };
         assert_eq!(r.path, PathBuf::from("/a/has space/f.txt"));
@@ -262,8 +321,7 @@ mod tests {
 
     #[test]
     fn parses_diagnostics_with_counts_first_and_verbatim_path() {
-        let Message::Diagnostics(d) = parse_line("diagnostics 2 5 /a/has space/f.rs ").unwrap()
-        else {
+        let Line::Diagnostics(d) = parse_line("diagnostics 2 5 /a/has space/f.rs ").unwrap() else {
             panic!("expected diagnostics");
         };
         assert_eq!(d.path, PathBuf::from("/a/has space/f.rs "));
@@ -274,7 +332,7 @@ mod tests {
                 warnings: 5
             }
         );
-        let Message::Diagnostics(d) = parse_line("diagnostics 0 0 /a/f.rs").unwrap() else {
+        let Line::Diagnostics(d) = parse_line("diagnostics 0 0 /a/f.rs").unwrap() else {
             panic!("expected diagnostics");
         };
         assert!(d.counts.is_empty(), "both zero clears the file");
@@ -292,5 +350,52 @@ mod tests {
             parse_line("unknown-command /a").is_none(),
             "ignored, not an error"
         );
+    }
+
+    #[test]
+    fn snapshot_batches_are_delivered_whole_and_only_when_well_formed() {
+        let counts = |e, w| Counts {
+            errors: e,
+            warnings: w,
+        };
+        let mut batch: Batch = None;
+        assert!(fold_line(&mut batch, parse_line("diagnostics-begin 7").unwrap()).is_none());
+        assert!(fold_line(&mut batch, parse_line("diagnostics 1 0 /a.rs").unwrap()).is_none());
+        assert!(fold_line(&mut batch, parse_line("diagnostics 0 2 /b c.rs").unwrap()).is_none());
+        let Some(Message::DiagnosticsSnapshot { seq, files }) =
+            fold_line(&mut batch, parse_line("diagnostics-end 7").unwrap())
+        else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(seq, 7);
+        assert_eq!(
+            files,
+            vec![
+                (PathBuf::from("/a.rs"), counts(1, 0)),
+                (PathBuf::from("/b c.rs"), counts(0, 2))
+            ]
+        );
+        assert!(batch.is_none(), "the batch is consumed");
+
+        // An empty snapshot is still a snapshot (everything clear).
+        fold_line(&mut batch, parse_line("diagnostics-begin 8").unwrap());
+        assert!(matches!(
+            fold_line(&mut batch, parse_line("diagnostics-end 8").unwrap()),
+            Some(Message::DiagnosticsSnapshot { seq: 8, files }) if files.is_empty()
+        ));
+
+        // A mismatched end drops the batch instead of applying a partial one.
+        fold_line(&mut batch, parse_line("diagnostics-begin 9").unwrap());
+        fold_line(&mut batch, parse_line("diagnostics 1 0 /a.rs").unwrap());
+        assert!(fold_line(&mut batch, parse_line("diagnostics-end 3").unwrap()).is_none());
+        assert!(batch.is_none());
+        assert!(parse_line("diagnostics-begin x").is_none());
+        assert!(parse_line("diagnostics-end").is_none());
+
+        // Outside a batch, a diagnostics line stands on its own.
+        assert!(matches!(
+            fold_line(&mut batch, parse_line("diagnostics 1 0 /a.rs").unwrap()),
+            Some(Message::Diagnostics(_))
+        ));
     }
 }
