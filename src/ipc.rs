@@ -11,15 +11,19 @@
 //!                             — one file's current LSP diagnostic counts; both
 //!                               zero clears the file. Counts come first so the
 //!                               path can contain spaces.
-//!   `diagnostics-begin <seq>` … `diagnostics-end <seq>`
+//!   `diagnostics-begin [<sender>] <seq>` … `diagnostics-end <seq>`
 //!                             — a complete snapshot: the `diagnostics` lines in
 //!                               between are every file that has any, applied
 //!                               atomically at `end`; files not listed are
-//!                               clear. `seq` grows with each snapshot the
-//!                               sender produces, and a snapshot older than the
-//!                               one applied is ignored, so connections
-//!                               handled out of order cannot leave stale
-//!                               colors. This is what the patched Helix sends.
+//!                               clear. `seq` grows with each snapshot a sender
+//!                               produces; `sender` identifies the editor
+//!                               process. A snapshot from the last sender that
+//!                               is not newer than the one applied is ignored
+//!                               (connections are served on separate threads),
+//!                               while a snapshot from another sender is
+//!                               always applied, so a restarted editor takes
+//!                               over at once. This is what the patched Helix
+//!                               sends.
 //! The path is taken verbatim up to the newline (no trimming — trailing
 //! whitespace is legal in file names).
 
@@ -54,6 +58,8 @@ pub enum Message {
     Reveal(Reveal),
     Diagnostics(DiagnosticsUpdate),
     DiagnosticsSnapshot {
+        /// Who sent it; empty when the sender did not say.
+        sender: String,
         seq: u64,
         files: Vec<(PathBuf, Counts)>,
     },
@@ -64,35 +70,45 @@ pub enum Message {
 enum Line {
     Reveal(Reveal),
     Diagnostics(DiagnosticsUpdate),
-    Begin(u64),
+    Begin { sender: String, seq: u64 },
     End(u64),
 }
 
-/// Lines of a snapshot batch being read on one connection.
-type Batch = Option<(u64, Vec<(PathBuf, Counts)>)>;
+/// A snapshot batch being read on one connection.
+struct Batch {
+    sender: String,
+    seq: u64,
+    files: Vec<(PathBuf, Counts)>,
+}
 
 /// Fold one line into the connection's batch state; returns the message to
 /// deliver, if the line completes one. A `diagnostics` line outside a batch
 /// is delivered on its own; inside, it joins the batch. A batch is delivered
 /// only when its `end` carries the same sequence as its `begin`.
-fn fold_line(batch: &mut Batch, line: Line) -> Option<Message> {
+fn fold_line(batch: &mut Option<Batch>, line: Line) -> Option<Message> {
     match line {
         Line::Reveal(reveal) => Some(Message::Reveal(reveal)),
-        Line::Begin(seq) => {
-            *batch = Some((seq, Vec::new()));
+        Line::Begin { sender, seq } => {
+            *batch = Some(Batch {
+                sender,
+                seq,
+                files: Vec::new(),
+            });
             None
         }
         Line::Diagnostics(update) => match batch {
-            Some((_, files)) => {
-                files.push((update.path, update.counts));
+            Some(batch) => {
+                batch.files.push((update.path, update.counts));
                 None
             }
             None => Some(Message::Diagnostics(update)),
         },
         Line::End(seq) => match batch.take() {
-            Some((begun, files)) if begun == seq => {
-                Some(Message::DiagnosticsSnapshot { seq, files })
-            }
+            Some(batch) if batch.seq == seq => Some(Message::DiagnosticsSnapshot {
+                sender: batch.sender,
+                seq,
+                files: batch.files,
+            }),
             _ => None,
         },
     }
@@ -198,7 +214,7 @@ fn handle(stream: UnixStream, sender: &Sender<Message>) {
     // newline, never closing) frees this thread instead of leaking it.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let reader = BufReader::new(stream);
-    let mut batch: Batch = None;
+    let mut batch: Option<Batch> = None;
     for line in reader.lines().map_while(Result::ok) {
         if let Some(message) = parse_line(&line).and_then(|line| fold_line(&mut batch, line)) {
             let _ = sender.send(message);
@@ -212,8 +228,13 @@ fn handle(stream: UnixStream, sender: &Sender<Message>) {
 /// a file name. Unknown commands are ignored, so an older treelix paired with
 /// a newer Helix just misses the feature.
 fn parse_line(line: &str) -> Option<Line> {
-    if let Some(seq) = line.strip_prefix("diagnostics-begin ") {
-        return seq.parse().ok().map(Line::Begin);
+    if let Some(rest) = line.strip_prefix("diagnostics-begin ") {
+        // `<seq>` alone, or `<sender> <seq>`.
+        let (sender, seq) = match rest.rsplit_once(' ') {
+            Some((sender, seq)) => (sender.to_string(), seq),
+            None => (String::new(), rest),
+        };
+        return seq.parse().ok().map(|seq| Line::Begin { sender, seq });
     }
     if let Some(seq) = line.strip_prefix("diagnostics-end ") {
         return seq.parse().ok().map(Line::End);
@@ -358,16 +379,17 @@ mod tests {
             errors: e,
             warnings: w,
         };
-        let mut batch: Batch = None;
+        let mut batch: Option<Batch> = None;
         assert!(fold_line(&mut batch, parse_line("diagnostics-begin 7").unwrap()).is_none());
         assert!(fold_line(&mut batch, parse_line("diagnostics 1 0 /a.rs").unwrap()).is_none());
         assert!(fold_line(&mut batch, parse_line("diagnostics 0 2 /b c.rs").unwrap()).is_none());
-        let Some(Message::DiagnosticsSnapshot { seq, files }) =
+        let Some(Message::DiagnosticsSnapshot { sender, seq, files }) =
             fold_line(&mut batch, parse_line("diagnostics-end 7").unwrap())
         else {
             panic!("expected a snapshot");
         };
         assert_eq!(seq, 7);
+        assert_eq!(sender, "", "no sender given");
         assert_eq!(
             files,
             vec![
@@ -381,8 +403,17 @@ mod tests {
         fold_line(&mut batch, parse_line("diagnostics-begin 8").unwrap());
         assert!(matches!(
             fold_line(&mut batch, parse_line("diagnostics-end 8").unwrap()),
-            Some(Message::DiagnosticsSnapshot { seq: 8, files }) if files.is_empty()
+            Some(Message::DiagnosticsSnapshot { seq: 8, files, .. }) if files.is_empty()
         ));
+
+        // With a sender: `diagnostics-begin <sender> <seq>`.
+        assert_eq!(
+            parse_line("diagnostics-begin hx-4242-17 12"),
+            Some(Line::Begin {
+                sender: "hx-4242-17".into(),
+                seq: 12
+            })
+        );
 
         // A mismatched end drops the batch instead of applying a partial one.
         fold_line(&mut batch, parse_line("diagnostics-begin 9").unwrap());

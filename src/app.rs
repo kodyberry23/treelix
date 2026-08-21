@@ -1,5 +1,6 @@
 //! Application state and the main event loop.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,7 @@ pub enum AppEvent {
     Diagnostics(ipc::DiagnosticsUpdate),
     /// A complete set of diagnostics; `seq` orders snapshots from one sender.
     DiagnosticsSnapshot {
+        sender: String,
         seq: u64,
         files: Vec<(PathBuf, diagnostics::Counts)>,
     },
@@ -105,8 +107,9 @@ pub struct App {
     git_schedule: ScanSchedule,
     diagnostics: DiagnosticsData,
     diagnostics_mode: diagnostics::Mode,
-    /// Sequence of the last snapshot applied; older ones are ignored.
-    diagnostics_seq: u64,
+    /// Sender and sequence of the last snapshot applied: a later snapshot from
+    /// the same sender must be newer; any other sender is taken as is.
+    diagnostics_origin: Option<(String, u64)>,
     status: Option<String>,
     // When the transient status message should disappear on its own. Set
     // alongside `status` by set_status(); the event loop wakes at this
@@ -196,8 +199,8 @@ impl App {
                     let event = match message {
                         ipc::Message::Reveal(reveal) => AppEvent::Reveal(reveal),
                         ipc::Message::Diagnostics(update) => AppEvent::Diagnostics(update),
-                        ipc::Message::DiagnosticsSnapshot { seq, files } => {
-                            AppEvent::DiagnosticsSnapshot { seq, files }
+                        ipc::Message::DiagnosticsSnapshot { sender, seq, files } => {
+                            AppEvent::DiagnosticsSnapshot { sender, seq, files }
                         }
                     };
                     if tx.send(event).is_err() {
@@ -222,7 +225,7 @@ impl App {
             git: GitData::default(),
             git_schedule: ScanSchedule::default(),
             diagnostics: DiagnosticsData::default(),
-            diagnostics_seq: 0,
+            diagnostics_origin: None,
             diagnostics_mode: diagnostics::Mode::parse(&config.diagnostics).unwrap_or_else(|| {
                 eprintln!(
                     "treelix: unknown diagnostics = \"{}\" (off | errors | warnings); using warnings",
@@ -415,21 +418,27 @@ impl App {
                 if self.diagnostics_mode == diagnostics::Mode::Off {
                     return;
                 }
-                // Tree nodes are keyed by canonical paths (see the Reveal arm);
-                // the editor sends lexically normalized ones.
-                let path = canonicalize_lenient(&path);
+                let mut roots = HashMap::new();
+                let path = self.path_into_tree(&path, &mut roots);
                 if self.diagnostics.update(path, counts) {
                     self.diagnostics_changed();
                 }
             }
-            AppEvent::DiagnosticsSnapshot { seq, files } => {
-                if self.diagnostics_mode == diagnostics::Mode::Off || seq <= self.diagnostics_seq {
+            AppEvent::DiagnosticsSnapshot { sender, seq, files } => {
+                if self.diagnostics_mode == diagnostics::Mode::Off {
                     return;
                 }
-                self.diagnostics_seq = seq;
-                let files = files
+                if let Some((last_sender, last_seq)) = &self.diagnostics_origin {
+                    if *last_sender == sender && seq <= *last_seq {
+                        return;
+                    }
+                }
+                self.diagnostics_origin = Some((sender, seq));
+                let mut roots = HashMap::new();
+                let files: Vec<_> = files
                     .into_iter()
-                    .map(|(path, counts)| (canonicalize_lenient(&path), counts));
+                    .map(|(path, counts)| (self.path_into_tree(&path, &mut roots), counts))
+                    .collect();
                 if self.diagnostics.replace(files) {
                     self.diagnostics_changed();
                 }
@@ -1529,6 +1538,30 @@ impl App {
         });
     }
 
+    /// Map a path the editor reported onto the tree's keys. Tree nodes are
+    /// keyed by the canonical root plus the lexical path below it (an in-tree
+    /// symlinked directory keeps its own node), while the editor sends
+    /// lexically normalized paths whose root prefix may be a symlink (macOS
+    /// `/tmp`, a linked project directory). So: find the ancestor that IS the
+    /// tree root once canonicalized, and keep everything below it as sent.
+    /// Paths outside the tree are canonicalized as a whole. `roots` memoizes
+    /// ancestor lookups across one batch.
+    fn path_into_tree(&self, path: &Path, roots: &mut HashMap<PathBuf, bool>) -> PathBuf {
+        let root = &self.tree.root.path;
+        for ancestor in path.ancestors() {
+            let is_root = *roots.entry(ancestor.to_path_buf()).or_insert_with(|| {
+                ancestor == root || std::fs::canonicalize(ancestor).is_ok_and(|real| real == *root)
+            });
+            if is_root {
+                return match path.strip_prefix(ancestor) {
+                    Ok(rest) => root.join(rest),
+                    Err(_) => root.clone(),
+                };
+            }
+        }
+        canonicalize_lenient(path)
+    }
+
     /// The diagnostics set changed: recolor and redraw.
     fn diagnostics_changed(&mut self) {
         self.apply_overlays();
@@ -2439,6 +2472,7 @@ mod tests {
             warnings: w,
         };
         app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-1".into(),
             seq: 2,
             files: vec![(a.clone(), counts(1, 0)), (deep.clone(), counts(0, 1))],
         });
@@ -2449,12 +2483,14 @@ mod tests {
         );
         // An older snapshot (a connection handled late) changes nothing.
         app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-1".into(),
             seq: 1,
             files: vec![(a.clone(), counts(0, 0))],
         });
         assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
         // A newer one that omits a file clears it.
         app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-1".into(),
             seq: 3,
             files: vec![(deep.clone(), counts(0, 1))],
         });
@@ -2462,6 +2498,70 @@ mod tests {
         assert_eq!(
             diag_of(&app, &root.join("sub")).map(|d| d.severity),
             Some(Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn a_different_sender_is_applied_whatever_its_sequence() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, _) = app_with_tree();
+        let a = root.join("a.txt");
+        let counts = |e, w| Counts {
+            errors: e,
+            warnings: w,
+        };
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-old".into(),
+            seq: 900,
+            files: vec![(a.clone(), counts(1, 0))],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        // A restarted editor starts counting again; its (lower) seq still wins.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-new".into(),
+            seq: 1,
+            files: vec![],
+        });
+        assert_eq!(
+            diag_of(&app, &a),
+            None,
+            "the new sender's empty set applied"
+        );
+        // And from now on the new sender's own ordering holds.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-new".into(),
+            seq: 1,
+            files: vec![(a.clone(), counts(0, 1))],
+        });
+        assert_eq!(
+            diag_of(&app, &a),
+            None,
+            "same seq from the same sender: ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_paths_inside_an_in_tree_symlink_keep_their_node() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, _) = app_with_tree();
+        // /root/linked -> /elsewhere, containing t.txt
+        let elsewhere = fs::canonicalize(unique_tmpdir()).unwrap();
+        fs::write(elsewhere.join("t.txt"), b"x").unwrap();
+        let linked = root.join("linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        app.handle_event(AppEvent::Diagnostics(ipc::DiagnosticsUpdate {
+            path: linked.join("t.txt"),
+            counts: Counts {
+                errors: 1,
+                warnings: 0,
+            },
+        }));
+        assert_eq!(
+            diag_of(&app, &linked).map(|d| d.severity),
+            Some(Severity::Error),
+            "the symlinked directory's own node is colored"
         );
     }
 

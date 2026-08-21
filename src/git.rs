@@ -106,41 +106,66 @@ impl ScanSchedule {
     }
 }
 
+/// Outcome of running a git command.
+enum Capture {
+    Output(Vec<u8>),
+    /// git ran and exited non-zero (for `rev-parse`: not a repository).
+    Failed,
+    /// git could not be run, or was killed at the timeout.
+    Broken,
+}
+
 fn run_capture(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    match capture(&mut cmd, timeout) {
+        Capture::Output(out) => Some(out),
+        Capture::Failed | Capture::Broken => None,
+    }
+}
+
+fn capture(cmd: &mut Command, timeout: Duration) -> Capture {
+    let Ok(mut child) = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return Capture::Broken;
+    };
     // Drain stdout on a separate thread so a large status output can't fill the
     // pipe buffer and deadlock the child before it exits.
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        return Capture::Broken;
+    };
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
         buf
     });
     let deadline = Instant::now() + timeout;
-    let success = loop {
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
+            Ok(Some(status)) => {
+                break if status.success() {
+                    Capture::Output(Vec::new())
+                } else {
+                    Capture::Failed
+                };
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break false;
+                    break Capture::Broken;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break false;
+                break Capture::Broken;
             }
         }
     };
     let buf = reader.join().unwrap_or_default();
-    success.then_some(buf)
+    match outcome {
+        Capture::Output(_) => Capture::Output(buf),
+        other => other,
+    }
 }
 
 /// A single effective git status category for a file (or the propagated
@@ -211,20 +236,34 @@ pub struct GitData {
 }
 
 /// Discover the git top-level for `root`, or `None` if not a repo.
-pub fn toplevel(root: &Path) -> Option<PathBuf> {
+/// Where the repository containing `root` lives.
+pub enum Toplevel {
+    Repo(PathBuf),
+    NotRepo,
+    /// git could not answer (timeout, not installed): unknown, not "no repo".
+    Unknown,
+}
+
+pub fn toplevel(root: &Path) -> Toplevel {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(root)
         .args(["rev-parse", "--show-toplevel"]);
     // Bounded like the status scan itself: a hung git here would hold the
-    // single-flight schedule.
-    let out = run_capture(cmd, GIT_TIMEOUT)?;
-    let s = String::from_utf8_lossy(&out);
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
+    // single-flight schedule. A timeout must not read as "not a repository",
+    // which would wipe every glyph without a retry.
+    match capture(&mut cmd, GIT_TIMEOUT) {
+        Capture::Output(out) => {
+            let s = String::from_utf8_lossy(&out);
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Toplevel::NotRepo
+            } else {
+                Toplevel::Repo(PathBuf::from(trimmed))
+            }
+        }
+        Capture::Failed => Toplevel::NotRepo,
+        Capture::Broken => Toplevel::Unknown,
     }
 }
 
@@ -237,8 +276,10 @@ pub fn toplevel(root: &Path) -> Option<PathBuf> {
 /// statuses rather than wiping every glyph (and, with the git-clean filter
 /// active, emptying the whole tree).
 pub fn scan(root: &Path) -> Option<GitData> {
-    let Some(top) = toplevel(root) else {
-        return Some(GitData::default());
+    let top = match toplevel(root) {
+        Toplevel::Repo(top) => top,
+        Toplevel::NotRepo => return Some(GitData::default()),
+        Toplevel::Unknown => return None,
     };
 
     let mut cmd = Command::new("git");

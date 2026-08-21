@@ -28,11 +28,13 @@ It was built to replace [broot](https://dystroy.org/broot/) as the file sidebar.
 - **Open in Helix**: `<CR>` opens the file in the running Helix over its Unix
   socket (helix-editor/helix PR #13896), with vsplit/hsplit and system-open.
 - **Diagnostics from the editor**: the patched Helix pushes every file's LSP
-  error/warning counts over the same socket (as whole snapshots, applied
-  atomically and in order); files turn red or yellow with a count after the
-  name, and every folder above takes the worst severity inside, so a problem
-  in a collapsed folder is still visible. `diagnostics = "errors" | "off"` in
-  the config narrows or disables it.
+  error/warning counts over the same socket as whole snapshots
+  (`diagnostics-begin <sender> <seq>` … `diagnostics-end <seq>`), applied
+  atomically; from one sender only newer snapshots apply, and a new sender (a
+  restarted editor) applies at once. Files turn red or yellow with a count
+  after the name, and every folder above takes the worst severity inside, so
+  a problem in a collapsed folder is still visible. `diagnostics = "errors" |
+  "off"` in the config narrows or disables it.
 - **Reveal / follow**: a tiny IPC socket lets Helix tell treelix to reveal the
   current buffer (`treelix reveal <path>`), replacing broot's
   `--listen`/`--send`. With the helix-files integration, the patched Helix
