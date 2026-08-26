@@ -106,16 +106,36 @@ struct Below {
 }
 
 /// Every file the editor reported diagnostics for, keyed by absolute path.
+///
+/// Keys are case-folded: macOS filesystems are case-insensitive by default, so
+/// the editor may know a file by different casing than the directory listing
+/// (TypeScript imports and `hx SRC/file` resolve case-insensitively). Without
+/// folding, the folder colors (ancestor tallies match) while the file itself
+/// misses its exact-match lookup — a folder stuck red with a plain file in it.
 #[derive(Default, Debug)]
 pub struct DiagnosticsData {
     files: HashMap<PathBuf, Counts>,
     dirs: HashMap<PathBuf, Below>,
 }
 
+/// The comparison form of a path: NFC-normalized and Unicode-lowercased when
+/// it is UTF-8 (the overwhelming case), byte-identical otherwise. NFC matters
+/// on macOS too: the filesystem may hand back decomposed names (NFD) while an
+/// editor reports the composed form, which is the same folder-red/file-plain
+/// symptom as a case difference.
+fn fold(path: &Path) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization as _;
+    match path.to_str() {
+        Some(utf8) => PathBuf::from(utf8.nfc().collect::<String>().to_lowercase()),
+        None => path.to_path_buf(),
+    }
+}
+
 impl DiagnosticsData {
     /// Record the counts for `path`; zero counts forget it. Returns whether
     /// anything changed, so callers can skip a redraw for repeated pushes.
     pub fn update(&mut self, path: PathBuf, counts: Counts) -> bool {
+        let path = fold(&path);
         let previous = self.files.get(&path).copied();
         let next = (!counts.is_empty()).then_some(counts);
         if previous == next {
@@ -171,14 +191,16 @@ impl DiagnosticsData {
 
     /// What a file row shows at `min` and above.
     pub fn for_file(&self, path: &Path, min: Severity) -> Option<Diag> {
-        self.files.get(path).and_then(|counts| counts.shown(min))
+        self.files
+            .get(&fold(path))
+            .and_then(|counts| counts.shown(min))
     }
 
     /// The worst severity of any file under `dir` (at `min` and above). Based
     /// on the reported paths, not the tree's loaded children, so a directory
     /// never expanded still reflects what it contains.
     pub fn worst_under(&self, dir: &Path, min: Severity) -> Option<Diag> {
-        let below = self.dirs.get(dir)?;
+        let below = self.dirs.get(&fold(dir))?;
         let severity = if below.with_errors > 0 {
             Severity::Error
         } else if below.with_warnings > 0 && min <= Severity::Warning {
@@ -295,6 +317,48 @@ mod tests {
         assert_eq!(
             severity_under(&data, "/r", Severity::Warning),
             Some(Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn lookups_ignore_case_differences_between_editor_and_disk() {
+        let mut data = DiagnosticsData::default();
+        data.update(PathBuf::from("/r/src/header.tsx"), counts(1, 0));
+        assert_eq!(
+            data.for_file(Path::new("/r/src/Header.tsx"), Severity::Warning)
+                .map(|d| d.severity),
+            Some(Severity::Error),
+            "the on-disk casing finds the editor's lowercase report"
+        );
+        assert_eq!(
+            severity_under(&data, "/r/SRC", Severity::Warning),
+            Some(Severity::Error)
+        );
+        assert!(
+            !data.update(PathBuf::from("/r/src/HEADER.tsx"), counts(1, 0)),
+            "the same file under other casing is the same entry"
+        );
+        assert!(data.update(PathBuf::from("/r/src/Header.tsx"), counts(0, 0)));
+        assert_eq!(
+            data.for_file(Path::new("/r/src/header.tsx"), Severity::Warning),
+            None
+        );
+    }
+
+    #[test]
+    fn lookups_ignore_unicode_normalization_differences() {
+        let mut data = DiagnosticsData::default();
+        // NFD "café.rs" (e + combining acute) as a filesystem might list it...
+        data.update(PathBuf::from("/r/src/cafe\u{301}.rs"), counts(1, 0));
+        // ...found under the NFC form an editor reports (and vice versa).
+        assert_eq!(
+            data.for_file(Path::new("/r/src/caf\u{e9}.rs"), Severity::Warning)
+                .map(|d| d.severity),
+            Some(Severity::Error)
+        );
+        assert!(
+            !data.update(PathBuf::from("/r/src/CAF\u{c9}.rs"), counts(1, 0)),
+            "composed uppercase is still the same entry"
         );
     }
 

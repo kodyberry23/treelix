@@ -2534,6 +2534,77 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_expand_keeps_the_child_colored() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, deep) = app_with_tree();
+        let sub = root.join("sub");
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx".into(),
+            seq: 1,
+            files: vec![(
+                deep.clone(),
+                Counts {
+                    errors: 1,
+                    warnings: 0,
+                },
+            )],
+        });
+        assert_eq!(
+            diag_of(&app, &sub).map(|d| d.severity),
+            Some(Severity::Error)
+        );
+        // Move the cursor onto `sub` and expand with the keyboard, as a user would.
+        let sub_index = app.rows.iter().position(|r| r.path == sub).unwrap();
+        for _ in 0..sub_index {
+            app.handle_event(AppEvent::Key(key(KeyCode::Down)));
+        }
+        assert_eq!(app.current_row().unwrap().path, sub);
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter)));
+        assert!(app.rows.iter().any(|r| r.path == deep), "expanded");
+        assert_eq!(
+            diag_of(&app, &deep).map(|d| d.severity),
+            Some(Severity::Error),
+            "the file keeps its color after a keyboard expand"
+        );
+    }
+
+    #[test]
+    fn a_file_reported_under_other_casing_still_colors() {
+        use crate::diagnostics::{Counts, Severity};
+        let root = fs::canonicalize(unique_tmpdir()).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/Header.tsx"), b"x").unwrap();
+        let mut app = App::new(root.clone(), Config::default(), Theme::default());
+        // The editor knows the file by lowercase (macOS resolves imports
+        // case-insensitively), the tree read `Header.tsx` from disk.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx".into(),
+            seq: 1,
+            files: vec![(
+                root.join("src/header.tsx"),
+                Counts {
+                    errors: 1,
+                    warnings: 0,
+                },
+            )],
+        });
+        assert_eq!(
+            diag_of(&app, &root.join("src")).map(|d| d.severity),
+            Some(Severity::Error),
+            "the folder colors (tallies match by ancestor)"
+        );
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: root.join("src/Header.tsx"),
+            follow: false,
+        }));
+        assert_eq!(
+            diag_of(&app, &root.join("src/Header.tsx")).map(|d| d.severity),
+            Some(Severity::Error),
+            "the file colors despite the case difference"
+        );
+    }
+
+    #[test]
     fn a_different_sender_is_applied_whatever_its_sequence() {
         use crate::diagnostics::{Counts, Severity};
         let (mut app, root, _) = app_with_tree();
