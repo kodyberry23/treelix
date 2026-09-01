@@ -68,12 +68,18 @@ struct LiveScan {
     show_hidden: bool,
     show_ignored: bool,
     custom_active: bool,
-    /// Paths to keep visible: matches, their ancestors, and (with
+    /// Paths to keep visible: matches, their ancestors, everything beneath a
+    /// matched directory (so expanding it shows its contents), and (with
     /// `live_filter_show_folders`) every directory.
     visible: Rc<HashSet<PathBuf>>,
     /// Directories to expand so every match is on screen: the ancestor chains
     /// of matched entries, shallowest first, deduplicated.
     expand: Vec<PathBuf>,
+    /// Name-matched directories the walk deliberately never descended into
+    /// (high-churn pruning on non-git roots, symlink cycles / unresolvable
+    /// links). Their subtrees cannot be in `visible`, so expanding one admits
+    /// the freshly loaded children instead (`admit_expanded_dir`).
+    unwalked_match_roots: Vec<PathBuf>,
     /// The walk hit its entry cap; matches beyond it are missing.
     truncated: bool,
 }
@@ -924,6 +930,11 @@ impl App {
             self.reveal_children = !row.expanded;
             self.tree.toggle(&row.path);
             self.note_user_expansion(&row.path);
+            if !row.expanded {
+                // Just expanded: the children may live under a matched-but-
+                // unwalked subtree the scan never saw.
+                self.admit_expanded_dir(&row.path);
+            }
             self.apply_overlays();
             self.refresh_rows(Some(row.path));
         } else {
@@ -954,6 +965,7 @@ impl App {
             self.reveal_children = true;
             self.tree.expand(&row.path);
             self.note_user_expansion(&row.path);
+            self.admit_expanded_dir(&row.path);
             self.apply_overlays();
             self.refresh_rows(Some(row.path));
         } else if row.kind.is_dir() {
@@ -1392,12 +1404,27 @@ impl App {
                 ("bookmarked only", self.no_bookmark)
             }
         };
+        // An active live filter must be rebuilt through refresh_filtered_view:
+        // hidden/ignored/custom are scan-cache keys, and matches the toggle
+        // newly admits need the auto-expand pass — exactly like every other
+        // rescan path (query edit, git update, fs change, diagnostics).
+        if self.live_filter.is_some() {
+            self.refresh_filtered_view();
+            // The rebuild either cleared the status or set a truncation /
+            // over-cap warning. The warning outranks the toggle feedback: the
+            // toggle's effect is visible in the tree itself, while missing
+            // matches are invisible by definition.
+            if self.status.is_some() {
+                return;
+            }
+        } else {
+            self.refresh_rows(self.selected_path());
+        }
         self.set_status(format!(
             "{}: {}",
             label.0,
             if label.1 { "on" } else { "off" }
         ));
-        self.refresh_rows(self.selected_path());
     }
 
     fn toggle_group_empty(&mut self) {
@@ -1449,6 +1476,11 @@ impl App {
         // (the next toggle then inverts). The return value only decides whether
         // the cursor can move onto the revealed row.
         let landed = self.tree.reveal(&path);
+        // A reveal can expand into a matched-but-unwalked subtree (follow into
+        // an open node_modules/build on a non-git root while a filter is
+        // parked). Admit what it just opened, or the revealed row is filtered
+        // out and the expanded dir renders empty. No-op without a live scan.
+        self.readmit_unwalked_expansions();
         self.apply_overlays();
         self.refresh_rows(None);
         if landed {
@@ -1662,6 +1694,40 @@ impl App {
         Rc::clone(&self.live_scan.as_ref().unwrap().visible)
     }
 
+    /// The user just expanded `dir` while a live filter is active. If `dir`
+    /// sits inside a matched-but-unwalked subtree (`unwalked_match_roots`),
+    /// the scan's visible set knows nothing beneath it — admit the children
+    /// `Tree::expand` just loaded so the expansion shows them instead of an
+    /// empty directory. A no-op in every other case.
+    fn admit_expanded_dir(&mut self, dir: &Path) {
+        let under = self
+            .live_scan
+            .as_ref()
+            .is_some_and(|s| s.unwalked_match_roots.iter().any(|r| dir.starts_with(r)));
+        if !under {
+            return;
+        }
+        // loaded_children_of_expanded, not just the direct children: with
+        // group_empty on, Tree::expand chain-expands sole-child dirs whose
+        // own children must be admitted too.
+        let add = self.tree.loaded_children_of_expanded(dir);
+        self.admit_into_scan(add);
+    }
+
+    /// Insert `add` into the live scan's visible restrict set (no-op when the
+    /// scan is absent or `add` is empty).
+    fn admit_into_scan(&mut self, add: Vec<PathBuf>) {
+        if add.is_empty() {
+            return;
+        }
+        if let Some(scan) = &mut self.live_scan {
+            let visible = Rc::make_mut(&mut scan.visible);
+            for p in add {
+                visible.insert(p);
+            }
+        }
+    }
+
     fn ensure_live_scan(&mut self, query: &str) {
         let fresh = self.live_scan.as_ref().is_some_and(|s| {
             s.query == query
@@ -1672,14 +1738,36 @@ impl App {
         });
         if !fresh {
             self.live_scan = Some(self.scan_disk_for_filter(query));
+            // A rebuilt scan starts from disk and knows nothing about what
+            // admit_expanded_dir added to the previous one — without this, an
+            // fs burst or git-status change while the user is inside an open
+            // matched-but-unwalked dir (node_modules, build) empties it again.
+            self.readmit_unwalked_expansions();
         }
+    }
+
+    /// Re-admit into the fresh scan's visible set everything the user has
+    /// expanded under matched-but-unwalked subtrees (`unwalked_match_roots`):
+    /// the loaded children of each such root and of every expanded directory
+    /// beneath it. Collapsed levels are skipped — expanding them later routes
+    /// through admit_expanded_dir.
+    fn readmit_unwalked_expansions(&mut self) {
+        let roots = match &self.live_scan {
+            Some(s) if !s.unwalked_match_roots.is_empty() => s.unwalked_match_roots.clone(),
+            _ => return,
+        };
+        let mut add: Vec<PathBuf> = Vec::new();
+        for r in &roots {
+            add.extend(self.tree.loaded_children_of_expanded(r));
+        }
+        self.admit_into_scan(add);
     }
 
     /// Walk the tree on disk from the root — not just the lazily-loaded nodes —
     /// honoring the active visibility toggles. This is what lets the filter
     /// find files inside directories that were never expanded. Returns the
-    /// visible set (matches + ancestors + folder freebies) and the directories
-    /// to expand so matches actually render.
+    /// visible set (matches + ancestors + descendants of matched dirs + folder
+    /// freebies) and the directories to expand so matches actually render.
     fn scan_disk_for_filter(&mut self, query: &str) -> LiveScan {
         let root = self.tree.root.path.clone();
         let show_hidden = self.tree.show_hidden;
@@ -1700,6 +1788,7 @@ impl App {
 
         let mut visible = HashSet::new();
         let mut expand: Vec<PathBuf> = Vec::new();
+        let mut unwalked_match_roots: Vec<PathBuf> = Vec::new();
         let mut seen_expand = HashSet::new();
         // Canonical targets of symlinked dirs already descended into, so a
         // symlink loop (a/link -> a) terminates.
@@ -1707,8 +1796,13 @@ impl App {
         let mut walked = 0usize;
         let mut truncated = false;
         let mut buf = Vec::new();
-        let mut stack = vec![root.clone()];
-        'walk: while let Some(dir) = stack.pop() {
+        // The bool rides along the walk: true once an ancestor directory's own
+        // name matched the query. A matched dir admits its entire subtree —
+        // without this, the dir rendered but expanding it showed nothing (its
+        // children were absent from the restrict set) until the filter was
+        // cleared.
+        let mut stack = vec![(root.clone(), false)];
+        'walk: while let Some((dir, under_match)) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
@@ -1748,7 +1842,7 @@ impl App {
                     p.score(Utf32Str::new(&name, &mut buf), &mut self.matcher)
                         .is_some()
                 });
-                if matched || (is_dir && show_folders) {
+                if matched || under_match || (is_dir && show_folders) {
                     visible.insert(path.clone());
                     let mut cur = path.as_path();
                     while let Some(parent) = cur.parent() {
@@ -1781,20 +1875,42 @@ impl App {
                     }
                 }
                 if is_dir {
+                    // Subtree visibility this dir would pass down if descended:
+                    // its own name matched, or an ancestor's did. When the walk
+                    // skips such a dir (high-churn prune, symlink cycle), it is
+                    // recorded so expanding it can admit the children the walk
+                    // never saw — otherwise it renders as an empty dir.
+                    let inherits = (under_match || matched) && pat.is_some();
                     if prune_components && watcher::is_high_churn_name(&name) {
-                        continue; // shown/matched above, but never descended
+                        // Shown/matched above, but never descended.
+                        if inherits {
+                            unwalked_match_roots.push(path);
+                        }
+                        continue;
                     }
                     if is_link_dir {
                         // Descend only through symlinks whose target we have
                         // not walked yet — unresolvable or repeated targets
-                        // (cycles) are skipped.
-                        if let Ok(real) = std::fs::canonicalize(&path) {
-                            if visited_links.insert(real) {
-                                stack.push(path);
+                        // (cycles) are skipped (and remembered when matched,
+                        // so expanding one still shows its children).
+                        match std::fs::canonicalize(&path) {
+                            Ok(real) => {
+                                if visited_links.insert(real) {
+                                    stack.push((path, under_match || matched));
+                                } else if inherits {
+                                    // Cycle: never descended.
+                                    unwalked_match_roots.push(path);
+                                }
+                            }
+                            Err(_) => {
+                                // Unresolvable target: never descended.
+                                if inherits {
+                                    unwalked_match_roots.push(path);
+                                }
                             }
                         }
                     } else {
-                        stack.push(path);
+                        stack.push((path, under_match || matched));
                     }
                 }
             }
@@ -1808,6 +1924,7 @@ impl App {
             custom_active: self.custom_active,
             visible: Rc::new(visible),
             expand,
+            unwalked_match_roots,
             truncated,
         }
     }
@@ -3062,6 +3179,195 @@ mod tests {
         assert!(
             !app.rows.iter().any(|r| r.name == "unrelated"),
             "folder with no matches is hidden"
+        );
+    }
+
+    #[test]
+    fn expanding_a_matched_dir_shows_its_contents() {
+        // Regression: a dir whose own name matched the query rendered, but its
+        // children were never in the restrict set — expanding it showed an
+        // empty dir until the filter was cleared. Descendants of a matched dir
+        // inherit the match (transitively), while the auto-expansion still
+        // stops at the matched dir itself.
+        let (mut app, root, deep) = app_with_tree();
+        fs::create_dir(root.join("sub/nested")).unwrap();
+        fs::write(root.join("sub/nested/inner.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        // "b" matches only `sub` itself (no prefix of it matches anything
+        // deeper, so no auto-expansion has already opened `sub` — typing e.g.
+        // "sub" would, via the transient "s" prefix matching `nested`).
+        type_filter(&mut app, "b");
+        assert!(app.rows.iter().any(|r| r.name == "sub"), "matched dir shown");
+        assert!(!deep_visible(&app, &deep), "matched dir starts collapsed");
+
+        app.select_path(&root.join("sub"));
+        app.dispatch(Action::Expand);
+        assert!(
+            deep_visible(&app, &deep),
+            "children of the matched dir must be visible; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(app.rows.iter().any(|r| r.name == "nested"));
+
+        app.select_path(&root.join("sub/nested"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "inner.txt"),
+            "grandchildren inherit the match transitively"
+        );
+        // The filter still restricts everything outside the matched subtree.
+        assert!(!app.rows.iter().any(|r| r.name == "a.txt"));
+    }
+
+    #[test]
+    fn toggling_hidden_while_filtered_expands_to_new_matches() {
+        // Regression: toggling hidden/ignored while a filter was parked did
+        // rescan (the toggles are scan-cache keys) but skipped the
+        // auto-expand pass, so a match inside a collapsed hidden dir stayed
+        // off screen and the view read as "no results".
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir(root.join(".hid")).unwrap();
+        fs::write(root.join(".hid/secret.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "secret");
+        assert!(
+            !app.rows.iter().any(|r| r.name == "secret.txt"),
+            "hidden entries are pruned while the toggle is off"
+        );
+        app.on_key(key(KeyCode::Enter)); // park the filter, keep it active
+        app.dispatch(Action::ToggleHidden);
+        assert!(
+            app.rows.iter().any(|r| r.name == "secret.txt"),
+            "revealing hidden files must rescan AND auto-expand to the new match; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn expanding_a_matched_high_churn_dir_shows_children_on_non_git_roots() {
+        // "build" is a high-churn name: on a non-git root the filter walk
+        // never descends into it, so its children cannot be in the scan's
+        // visible set. Expanding it must admit the freshly loaded children
+        // instead of rendering an empty dir (the reported bug through a
+        // different door than descendant inheritance).
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir_all(root.join("build/lib")).unwrap();
+        fs::write(root.join("build/out.txt"), b"x").unwrap();
+        fs::write(root.join("build/lib/obj.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "build");
+        assert!(app.rows.iter().any(|r| r.name == "build"), "matched dir shown");
+
+        app.select_path(&root.join("build"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "out.txt"),
+            "children admitted on expand; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        app.select_path(&root.join("build/lib"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "obj.txt"),
+            "grandchildren admitted on their own expand"
+        );
+        assert!(
+            !app.rows.iter().any(|r| r.name == "a.txt"),
+            "the filter still applies outside the matched subtree"
+        );
+    }
+
+    #[test]
+    fn skipped_dir_inside_a_matched_subtree_expands_too() {
+        // A high-churn dir the walk prunes (non-git root) that sits INSIDE a
+        // matched subtree is visible through inheritance but was never
+        // descended — expanding it must admit its children just like a
+        // matched-by-name skipped dir.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir_all(root.join("pkg/node_modules")).unwrap();
+        fs::write(root.join("pkg/node_modules/dep.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "pkg");
+        app.select_path(&root.join("pkg"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "node_modules"),
+            "inherited-visible child dir renders"
+        );
+        app.select_path(&root.join("pkg/node_modules"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "dep.txt"),
+            "children of the pruned dir admitted on expand; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn admitted_children_survive_a_scan_rebuild() {
+        // Regression (review finding): admit_expanded_dir wrote into the
+        // cached scan's visible set, so any invalidation (fs burst, git
+        // status change) rebuilt the scan from disk and the open high-churn
+        // dir rendered empty again.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir(root.join("build")).unwrap();
+        fs::write(root.join("build/out.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "build");
+        app.select_path(&root.join("build"));
+        app.dispatch(Action::Expand);
+        assert!(app.rows.iter().any(|r| r.name == "out.txt"), "admitted on expand");
+
+        // Invalidate the scan the way the watcher does.
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        assert!(
+            app.rows.iter().any(|r| r.name == "out.txt"),
+            "children must be re-admitted after the scan rebuild; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reveal_into_an_unwalked_matched_subtree_admits_it() {
+        // Review finding: the reveal door (follow/explicit reveal from hx)
+        // expands dirs without the admission the keyboard/mouse doors get, so
+        // the revealed file's row was filtered out and the dir showed empty.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir(root.join("build")).unwrap();
+        fs::write(root.join("build/out.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "build");
+        app.on_key(key(KeyCode::Enter)); // park the filter
+        let target = root.join("build/out.txt");
+        app.handle_event(AppEvent::Reveal(ipc::Reveal {
+            path: target.clone(),
+            follow: false,
+        }));
+        assert!(
+            app.rows.iter().any(|r| r.path == target),
+            "revealed file must be admitted and rendered; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert_eq!(app.selected_path().as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn group_empty_chain_expand_admits_the_chained_children() {
+        // Review finding: with group_empty on, Tree::expand chain-expands a
+        // sole-child dir, but only the direct children were admitted — the
+        // chained level rendered as an expanded empty dir.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir_all(root.join("build/lib")).unwrap();
+        fs::write(root.join("build/lib/obj.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        app.dispatch(Action::ToggleGroupEmpty);
+        type_filter(&mut app, "build");
+        app.select_path(&root.join("build"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "obj.txt"),
+            "children of the chain-expanded level must be admitted; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
     }
 

@@ -130,7 +130,8 @@ Live filter (`f`): matches entries by name across the whole tree on disk —
 collapsed and never-opened directories included — and auto-expands the folders
 on the path to each match so results are visible immediately. The filtered view
 shows only matches, folders whose names match, and the ancestors needed to
-reach them (set `live_filter_show_folders = true` for nvim-tree's
+reach them; everything beneath a matched folder stays reachable, so expanding
+it shows its contents (set `live_filter_show_folders = true` for nvim-tree's
 `always_show_folders` behavior, where every folder stays visible). Clearing the
 filter (`Esc` or `F`) restores the expansion state from before it was armed.
 

@@ -291,6 +291,28 @@ impl Tree {
         walk(&mut self.root, true);
     }
 
+    /// Loaded children of `dir` and, recursively, of every expanded directory
+    /// beneath it (children under collapsed subdirs are omitted — they can't
+    /// render until their parent is expanded, which re-admits them then).
+    pub fn loaded_children_of_expanded(&self, dir: &Path) -> Vec<PathBuf> {
+        fn rec(n: &Node, out: &mut Vec<PathBuf>) {
+            if !n.expanded {
+                return;
+            }
+            for c in &n.children {
+                out.push(c.path.clone());
+                if c.is_dir() {
+                    rec(c, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(node) = self.root.find(dir) {
+            rec(node, &mut out);
+        }
+        out
+    }
+
     /// Re-root the tree at `path` (cd into). Preserves filter toggles.
     pub fn set_root(&mut self, path: PathBuf) {
         let mut root = Node::new(path, NodeKind::Directory, false, None);
