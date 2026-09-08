@@ -58,6 +58,11 @@ pub enum AppEvent {
         seq: u64,
         files: Vec<(PathBuf, diagnostics::Counts)>,
     },
+    /// The editor `sender` is exiting and retracts its snapshot.
+    DiagnosticsBye {
+        sender: String,
+        seq: u64,
+    },
 }
 
 /// Result of one live-filter scan of the tree on disk.
@@ -207,6 +212,9 @@ impl App {
                         ipc::Message::Diagnostics(update) => AppEvent::Diagnostics(update),
                         ipc::Message::DiagnosticsSnapshot { sender, seq, files } => {
                             AppEvent::DiagnosticsSnapshot { sender, seq, files }
+                        }
+                        ipc::Message::DiagnosticsBye { sender, seq } => {
+                            AppEvent::DiagnosticsBye { sender, seq }
                         }
                     };
                     if tx.send(event).is_err() {
@@ -445,6 +453,32 @@ impl App {
                     .map(|(path, counts)| (mapper.map(&path), counts))
                     .collect();
                 if self.diagnostics.replace(files) {
+                    self.diagnostics_changed();
+                }
+            }
+            AppEvent::DiagnosticsBye { sender, seq } => {
+                if self.diagnostics_mode == diagnostics::Mode::Off {
+                    return;
+                }
+                // Only the editor whose snapshot is on display may retract
+                // it: two editors can share one sidebar (the hx() wrapper
+                // exports the session socket to every hx in it), and a
+                // secondary one exiting must not wipe the primary's markers.
+                // Otherwise this is an empty snapshot under the same ordering
+                // rules, and the origin is KEPT at the new seq rather than
+                // cleared: a snapshot from this sender still in flight on
+                // another connection is then rejected as stale instead of
+                // repainting what was just cleared. Sender ids embed pid and
+                // start time, so a dead sender never returns to be wrongly
+                // rejected.
+                let Some((last_sender, last_seq)) = &self.diagnostics_origin else {
+                    return;
+                };
+                if *last_sender != sender || seq <= *last_seq {
+                    return;
+                }
+                self.diagnostics_origin = Some((sender, seq));
+                if self.diagnostics.replace(std::iter::empty()) {
                     self.diagnostics_changed();
                 }
             }
@@ -2760,6 +2794,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_farewell_from_the_displayed_editor_clears_everything() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, deep) = app_with_tree();
+        let a = root.join("a.txt");
+        let sub = root.join("sub");
+        let counts = |e, w| Counts {
+            errors: e,
+            warnings: w,
+        };
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-1".into(),
+            seq: 2,
+            files: vec![(a.clone(), counts(1, 0)), (deep.clone(), counts(0, 1))],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        assert_eq!(
+            diag_of(&app, &sub).map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-1".into(),
+            seq: 3,
+        });
+        assert_eq!(diag_of(&app, &a), None, "the file is clear");
+        assert_eq!(diag_of(&app, &sub), None, "and so is the folder above");
+
+        // The snapshot the farewell superseded arrives late on another
+        // connection: it must not repaint what the farewell cleared.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-1".into(),
+            seq: 2,
+            files: vec![(a.clone(), counts(1, 0))],
+        });
+        assert_eq!(diag_of(&app, &a), None, "a straggler is stale");
+
+        // A new editor takes over as usual.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-2".into(),
+            seq: 1,
+            files: vec![(a.clone(), counts(1, 0))],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+    }
+
+    #[test]
+    fn a_farewell_from_another_editor_or_out_of_order_is_ignored() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, _) = app_with_tree();
+        let a = root.join("a.txt");
+        let counts = |e, w| Counts {
+            errors: e,
+            warnings: w,
+        };
+        // Before any snapshot: nothing to retract, nothing to trip over.
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-1".into(),
+            seq: 1,
+        });
+        assert_eq!(diag_of(&app, &a), None);
+
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-1".into(),
+            seq: 5,
+            files: vec![(a.clone(), counts(1, 0))],
+        });
+        // Another editor leaving does not touch what this one shows.
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-2".into(),
+            seq: 99,
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        // A farewell not newer than the snapshot on display is stale.
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-1".into(),
+            seq: 5,
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        // The real one.
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-1".into(),
+            seq: 6,
+        });
+        assert_eq!(diag_of(&app, &a), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn diagnostics_paths_inside_an_in_tree_symlink_keep_their_node() {
@@ -3197,7 +3318,10 @@ mod tests {
         // deeper, so no auto-expansion has already opened `sub` — typing e.g.
         // "sub" would, via the transient "s" prefix matching `nested`).
         type_filter(&mut app, "b");
-        assert!(app.rows.iter().any(|r| r.name == "sub"), "matched dir shown");
+        assert!(
+            app.rows.iter().any(|r| r.name == "sub"),
+            "matched dir shown"
+        );
         assert!(!deep_visible(&app, &deep), "matched dir starts collapsed");
 
         app.select_path(&root.join("sub"));
@@ -3256,7 +3380,10 @@ mod tests {
         fs::write(root.join("build/lib/obj.txt"), b"x").unwrap();
         app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
         type_filter(&mut app, "build");
-        assert!(app.rows.iter().any(|r| r.name == "build"), "matched dir shown");
+        assert!(
+            app.rows.iter().any(|r| r.name == "build"),
+            "matched dir shown"
+        );
 
         app.select_path(&root.join("build"));
         app.dispatch(Action::Expand);
@@ -3316,7 +3443,10 @@ mod tests {
         type_filter(&mut app, "build");
         app.select_path(&root.join("build"));
         app.dispatch(Action::Expand);
-        assert!(app.rows.iter().any(|r| r.name == "out.txt"), "admitted on expand");
+        assert!(
+            app.rows.iter().any(|r| r.name == "out.txt"),
+            "admitted on expand"
+        );
 
         // Invalidate the scan the way the watcher does.
         app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));

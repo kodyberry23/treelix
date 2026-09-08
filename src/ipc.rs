@@ -24,6 +24,16 @@
 //!                               always applied, so a restarted editor takes
 //!                               over at once. This is what the patched Helix
 //!                               sends.
+//!   `diagnostics-bye <sender> <seq>`
+//!                             — the editor is exiting: retract its snapshot.
+//!                               An empty snapshot under the same ordering
+//!                               rules, except that it applies only when
+//!                               `sender` is the sender whose snapshot is on
+//!                               display; two editors can share one sidebar,
+//!                               and one leaving must not wipe the other's
+//!                               markers. Helix appends it to its final
+//!                               snapshot on one connection, so the two are
+//!                               always read in order.
 //! The path is taken verbatim up to the newline (no trimming — trailing
 //! whitespace is legal in file names).
 
@@ -63,6 +73,11 @@ pub enum Message {
         seq: u64,
         files: Vec<(PathBuf, Counts)>,
     },
+    /// The sender is exiting and retracts its snapshot (see the module doc).
+    DiagnosticsBye {
+        sender: String,
+        seq: u64,
+    },
 }
 
 /// One parsed wire line.
@@ -72,6 +87,7 @@ enum Line {
     Diagnostics(DiagnosticsUpdate),
     Begin { sender: String, seq: u64 },
     End(u64),
+    Bye { sender: String, seq: u64 },
 }
 
 /// A snapshot batch being read on one connection.
@@ -88,6 +104,9 @@ struct Batch {
 fn fold_line(batch: &mut Option<Batch>, line: Line) -> Option<Message> {
     match line {
         Line::Reveal(reveal) => Some(Message::Reveal(reveal)),
+        // Helix only sends a farewell after a `diagnostics-end`, so no batch
+        // is open; an open one is left alone either way, like a reveal.
+        Line::Bye { sender, seq } => Some(Message::DiagnosticsBye { sender, seq }),
         Line::Begin { sender, seq } => {
             *batch = Some(Batch {
                 sender,
@@ -238,6 +257,18 @@ fn parse_line(line: &str) -> Option<Line> {
     }
     if let Some(seq) = line.strip_prefix("diagnostics-end ") {
         return seq.parse().ok().map(Line::End);
+    }
+    if let Some(rest) = line.strip_prefix("diagnostics-bye ") {
+        // Both fields are mandatory, unlike `diagnostics-begin`'s optional
+        // sender: a farewell that does not say whose it is means nothing.
+        let (sender, seq) = rest.rsplit_once(' ')?;
+        if sender.is_empty() {
+            return None;
+        }
+        return seq.parse().ok().map(|seq| Line::Bye {
+            sender: sender.to_string(),
+            seq,
+        });
     }
     if let Some(rest) = line.strip_prefix("diagnostics ") {
         let mut parts = rest.splitn(3, ' ');
@@ -428,5 +459,56 @@ mod tests {
             fold_line(&mut batch, parse_line("diagnostics 1 0 /a.rs").unwrap()),
             Some(Message::Diagnostics(_))
         ));
+    }
+
+    #[test]
+    fn a_farewell_names_its_sender_and_sequence() {
+        assert_eq!(
+            parse_line("diagnostics-bye hx-4242-17 12"),
+            Some(Line::Bye {
+                sender: "hx-4242-17".into(),
+                seq: 12
+            })
+        );
+        // Both fields are required: an anonymous farewell retracts nothing.
+        assert!(parse_line("diagnostics-bye 12").is_none());
+        assert!(parse_line("diagnostics-bye hx-1").is_none());
+        assert!(parse_line("diagnostics-bye  12").is_none(), "empty sender");
+        assert!(parse_line("diagnostics-bye hx-1 x").is_none());
+        assert!(parse_line("diagnostics-bye").is_none());
+        assert!(parse_line("diagnostics-bye ").is_none());
+    }
+
+    #[test]
+    fn a_farewell_follows_its_snapshot_on_the_same_connection() {
+        // Exactly the bytes helix writes on exit: the final snapshot, then
+        // the farewell, one connection.
+        let mut batch: Option<Batch> = None;
+        assert!(fold_line(
+            &mut batch,
+            parse_line("diagnostics-begin hx-1-2 4").unwrap()
+        )
+        .is_none());
+        assert!(fold_line(&mut batch, parse_line("diagnostics 1 0 /a.rs").unwrap()).is_none());
+        assert!(matches!(
+            fold_line(&mut batch, parse_line("diagnostics-end 4").unwrap()),
+            Some(Message::DiagnosticsSnapshot { seq: 4, .. })
+        ));
+        assert!(matches!(
+            fold_line(&mut batch, parse_line("diagnostics-bye hx-1-2 5").unwrap()),
+            Some(Message::DiagnosticsBye { ref sender, seq: 5 }) if sender == "hx-1-2"
+        ));
+        assert!(batch.is_none());
+
+        // Inside a batch it is passed through and the batch survives.
+        fold_line(
+            &mut batch,
+            parse_line("diagnostics-begin hx-1-2 6").unwrap(),
+        );
+        assert!(matches!(
+            fold_line(&mut batch, parse_line("diagnostics-bye hx-1-2 7").unwrap()),
+            Some(Message::DiagnosticsBye { .. })
+        ));
+        assert!(batch.is_some());
     }
 }

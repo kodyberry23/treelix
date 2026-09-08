@@ -33,8 +33,11 @@ It was built to replace [broot](https://dystroy.org/broot/) as the file sidebar.
   atomically; from one sender only newer snapshots apply, and a new sender (a
   restarted editor) applies at once. Files turn red or yellow with a count
   after the name, and every folder above takes the worst severity inside, so
-  a problem in a collapsed folder is still visible. `diagnostics = "errors" |
-  "off"` in the config narrows or disables it.
+  a problem in a collapsed folder is still visible. An exiting editor sends
+  `diagnostics-bye <sender> <seq>`, which clears the tree only if that editor's
+  snapshot is the one on display, so a file it never saw fixed does not stay
+  red after it is gone. `diagnostics = "errors" | "off"` in the config narrows
+  or disables it.
 - **Reveal / follow**: a tiny IPC socket lets Helix tell treelix to reveal the
   current buffer (`treelix reveal <path>`), replacing broot's
   `--listen`/`--send`. With the helix-files integration, the patched Helix

@@ -163,7 +163,10 @@ impl DiagnosticsData {
         for (path, counts) in files {
             next.update(path, counts);
         }
+        // `dirs` is derived from `files` by `account`, so comparing the
+        // files is comparing everything; the assertion keeps that true.
         if next.files == self.files {
+            debug_assert_eq!(next.dirs, self.dirs, "dirs are derived from files");
             return false;
         }
         *self = next;
