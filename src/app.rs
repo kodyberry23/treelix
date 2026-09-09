@@ -82,8 +82,9 @@ struct LiveScan {
     expand: Vec<PathBuf>,
     /// Name-matched directories the walk deliberately never descended into
     /// (high-churn pruning on non-git roots, symlink cycles / unresolvable
-    /// links). Their subtrees cannot be in `visible`, so expanding one admits
-    /// the freshly loaded children instead (`admit_expanded_dir`).
+    /// links). Their subtrees cannot be in `visible`, so whatever the user
+    /// expands beneath one is admitted from the loaded tree instead, every
+    /// time the rows are rebuilt (`readmit_unwalked_expansions`).
     unwalked_match_roots: Vec<PathBuf>,
     /// The walk hit its entry cap; matches beyond it are missing.
     truncated: bool,
@@ -143,6 +144,9 @@ pub struct App {
     /// refreshes (git updates, redraws) don't re-walk the filesystem. Keyed
     /// by the scan inputs; invalidated explicitly on filesystem change.
     live_scan: Option<LiveScan>,
+    /// Entries one filter scan may examine before it gives up
+    /// (`FILTER_WALK_CAP`; lowered by tests to exercise truncation).
+    filter_walk_cap: usize,
     /// Directories the live filter auto-expanded to surface matches (only those
     /// that were NOT already open when it did so). On clear, exactly these are
     /// collapsed again — so the filter's exploration is undone without
@@ -260,6 +264,7 @@ impl App {
             live_filter: None,
             live_editing: false,
             live_scan: None,
+            filter_walk_cap: FILTER_WALK_CAP,
             filter_auto_expanded: HashSet::new(),
             filter_expanding: false,
             current_file: None,
@@ -964,11 +969,6 @@ impl App {
             self.reveal_children = !row.expanded;
             self.tree.toggle(&row.path);
             self.note_user_expansion(&row.path);
-            if !row.expanded {
-                // Just expanded: the children may live under a matched-but-
-                // unwalked subtree the scan never saw.
-                self.admit_expanded_dir(&row.path);
-            }
             self.apply_overlays();
             self.refresh_rows(Some(row.path));
         } else {
@@ -999,7 +999,6 @@ impl App {
             self.reveal_children = true;
             self.tree.expand(&row.path);
             self.note_user_expansion(&row.path);
-            self.admit_expanded_dir(&row.path);
             self.apply_overlays();
             self.refresh_rows(Some(row.path));
         } else if row.kind.is_dir() {
@@ -1510,11 +1509,6 @@ impl App {
         // (the next toggle then inverts). The return value only decides whether
         // the cursor can move onto the revealed row.
         let landed = self.tree.reveal(&path);
-        // A reveal can expand into a matched-but-unwalked subtree (follow into
-        // an open node_modules/build on a non-git root while a filter is
-        // parked). Admit what it just opened, or the revealed row is filtered
-        // out and the expanded dir renders empty. No-op without a live scan.
-        self.readmit_unwalked_expansions();
         self.apply_overlays();
         self.refresh_rows(None);
         if landed {
@@ -1723,29 +1717,16 @@ impl App {
     /// The live-filter restrict set for `query`, re-scanning the disk only when
     /// the cached scan no longer matches the current inputs. The set is behind
     /// an `Rc` so per-refresh reuse is a pointer copy, not a deep clone.
+    ///
+    /// Every rows rebuild passes through here, after whatever expanded the
+    /// tree (a keypress, a reveal, expand-all, the group-empty chain, a
+    /// rebuilt scan), so this is the one place that admits what the user has
+    /// opened under a matched-but-unwalked dir. Admitting per expansion door
+    /// instead left a door unadmitted three times over.
     fn live_matches(&mut self, query: &str) -> Rc<HashSet<PathBuf>> {
         self.ensure_live_scan(query);
+        self.readmit_unwalked_expansions();
         Rc::clone(&self.live_scan.as_ref().unwrap().visible)
-    }
-
-    /// The user just expanded `dir` while a live filter is active. If `dir`
-    /// sits inside a matched-but-unwalked subtree (`unwalked_match_roots`),
-    /// the scan's visible set knows nothing beneath it — admit the children
-    /// `Tree::expand` just loaded so the expansion shows them instead of an
-    /// empty directory. A no-op in every other case.
-    fn admit_expanded_dir(&mut self, dir: &Path) {
-        let under = self
-            .live_scan
-            .as_ref()
-            .is_some_and(|s| s.unwalked_match_roots.iter().any(|r| dir.starts_with(r)));
-        if !under {
-            return;
-        }
-        // loaded_children_of_expanded, not just the direct children: with
-        // group_empty on, Tree::expand chain-expands sole-child dirs whose
-        // own children must be admitted too.
-        let add = self.tree.loaded_children_of_expanded(dir);
-        self.admit_into_scan(add);
     }
 
     /// Insert `add` into the live scan's visible restrict set (no-op when the
@@ -1772,19 +1753,17 @@ impl App {
         });
         if !fresh {
             self.live_scan = Some(self.scan_disk_for_filter(query));
-            // A rebuilt scan starts from disk and knows nothing about what
-            // admit_expanded_dir added to the previous one — without this, an
-            // fs burst or git-status change while the user is inside an open
-            // matched-but-unwalked dir (node_modules, build) empties it again.
-            self.readmit_unwalked_expansions();
         }
     }
 
-    /// Re-admit into the fresh scan's visible set everything the user has
-    /// expanded under matched-but-unwalked subtrees (`unwalked_match_roots`):
-    /// the loaded children of each such root and of every expanded directory
-    /// beneath it. Collapsed levels are skipped — expanding them later routes
-    /// through admit_expanded_dir.
+    /// Admit into the scan's visible set everything the user has expanded
+    /// under matched-but-unwalked subtrees (`unwalked_match_roots`): the
+    /// loaded children of each such root and of every expanded directory
+    /// beneath it. Collapsed levels are skipped; they are picked up by the
+    /// rows rebuild that follows their expansion. Repeats are no-ops, and a
+    /// scan rebuilt from disk (which knows nothing of earlier admissions) is
+    /// filled in again the same way. Bounded by the expanded nodes under the
+    /// roots, which the flatten that follows visits anyway.
     fn readmit_unwalked_expansions(&mut self) {
         let roots = match &self.live_scan {
             Some(s) if !s.unwalked_match_roots.is_empty() => s.unwalked_match_roots.clone(),
@@ -1842,8 +1821,25 @@ impl App {
             };
             for entry in entries.flatten() {
                 walked += 1;
-                if walked > FILTER_WALK_CAP {
+                if walked > self.filter_walk_cap {
                     truncated = true;
+                    // Every dir still queued, and this one (cut off partway),
+                    // is on screen if it matched or inherits a match, but its
+                    // children were never seen: record them as unwalked so
+                    // expanding one admits what it loads instead of rendering
+                    // an empty dir. Unmatched dirs stay as they are; their
+                    // missing matches are what the truncation notice is for.
+                    if pat.is_some() {
+                        if under_match {
+                            unwalked_match_roots.push(dir.clone());
+                        }
+                        unwalked_match_roots.extend(
+                            stack
+                                .drain(..)
+                                .filter(|(_, inherits)| *inherits)
+                                .map(|(p, _)| p),
+                        );
+                    }
                     break 'walk;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -3432,8 +3428,8 @@ mod tests {
 
     #[test]
     fn admitted_children_survive_a_scan_rebuild() {
-        // Regression (review finding): admit_expanded_dir wrote into the
-        // cached scan's visible set, so any invalidation (fs burst, git
+        // Regression (review finding): admissions used to be written into the
+        // cached scan's visible set once, so any invalidation (fs burst, git
         // status change) rebuilt the scan from disk and the open high-churn
         // dir rendered empty again.
         let (mut app, root, _deep) = app_with_tree();
@@ -3497,6 +3493,80 @@ mod tests {
         assert!(
             app.rows.iter().any(|r| r.name == "obj.txt"),
             "children of the chain-expanded level must be admitted; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn expand_all_admits_the_unwalked_matched_dirs() {
+        // Review finding: ExpandAll expanded a matched-but-unwalked dir
+        // (build/ is pruned as high-churn on a non-git root) through a door
+        // that never admitted its children, so it rendered expanded and empty.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir(root.join("build")).unwrap();
+        fs::write(root.join("build/out.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "build");
+        app.dispatch(Action::ExpandAll);
+        assert!(
+            app.rows.iter().any(|r| r.name == "out.txt"),
+            "children of the unwalked dir must be admitted; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !app.rows.iter().any(|r| r.name == "a.txt"),
+            "the filter still applies outside the matched subtree"
+        );
+    }
+
+    #[test]
+    fn turning_group_empty_on_admits_the_chained_level() {
+        // Review finding: with build/ open (lib admitted, collapsed), turning
+        // group-empty on chain-expands build/lib but admitted nothing, so the
+        // chained level rendered as an expanded empty dir.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir_all(root.join("build/lib")).unwrap();
+        fs::write(root.join("build/lib/obj.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        type_filter(&mut app, "build");
+        app.select_path(&root.join("build"));
+        app.dispatch(Action::Expand);
+        assert!(app.rows.iter().any(|r| r.name == "lib"));
+        assert!(!app.rows.iter().any(|r| r.name == "obj.txt"));
+        app.dispatch(Action::ToggleGroupEmpty);
+        assert!(
+            app.rows.iter().any(|r| r.name == "obj.txt"),
+            "the chained level's children must be admitted; rows: {:?}",
+            app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_matched_dir_cut_off_by_the_walk_cap_still_expands() {
+        // Review finding: when the walk hit its cap, matched dirs still queued
+        // were visible but never walked nor recorded as unwalked, so expanding
+        // one showed nothing until the filter was cleared.
+        let (mut app, root, _deep) = app_with_tree();
+        fs::create_dir(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/inner.txt"), b"x").unwrap();
+        app.handle_event(AppEvent::Fs(watcher::FsChange::Rescan));
+        // The root holds a.txt, sub and pkg: the cap lets the walk see all
+        // three (so pkg matches and is queued) and stops it before descending.
+        app.filter_walk_cap = 3;
+        type_filter(&mut app, "pkg");
+        assert!(
+            app.live_scan.as_ref().is_some_and(|s| s.truncated),
+            "the cap hit"
+        );
+        assert!(
+            app.rows.iter().any(|r| r.name == "pkg"),
+            "the matched dir is shown"
+        );
+        app.select_path(&root.join("pkg"));
+        app.dispatch(Action::Expand);
+        assert!(
+            app.rows.iter().any(|r| r.name == "inner.txt"),
+            "its children are admitted on expand; rows: {:?}",
             app.rows.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
     }
