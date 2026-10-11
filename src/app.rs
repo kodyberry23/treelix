@@ -26,7 +26,7 @@ use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
 use crate::clipboard::{ClipOp, Clipboard};
 use crate::config::Config;
-use crate::diagnostics::{self, DiagnosticsData};
+use crate::diagnostics::{self, DiagnosticsData, Sources};
 use crate::editor::{self, OpenMode};
 use crate::git::{self, AfterScan, GitData, GitStatus, ScanSchedule};
 use crate::keymap::{self, Action};
@@ -117,11 +117,18 @@ pub struct App {
     pending: String,
     git: GitData,
     git_schedule: ScanSchedule,
+    /// What the tree shows: the union of `diagnostic_sources`.
     diagnostics: DiagnosticsData,
     diagnostics_mode: diagnostics::Mode,
-    /// Sender and sequence of the last snapshot applied: a later snapshot from
-    /// the same sender must be newer; any other sender is taken as is.
-    diagnostics_origin: Option<(String, u64)>,
+    /// The latest snapshot of every editor pushing to this sidebar.
+    diagnostic_sources: Sources,
+    /// Whether an editor process still exists; `diagnostics::process_alive`,
+    /// replaced in tests to fake an editor's death.
+    pid_alive: fn(u32) -> bool,
+    /// When to next check that the editors behind the marks are still
+    /// running. Armed only while a prunable sender has marks on display, so
+    /// an idle sidebar never wakes for it.
+    diagnostics_prune_at: Option<Instant>,
     status: Option<String>,
     // When the transient status message should disappear on its own. Set
     // alongside `status` by set_status(); the event loop wakes at this
@@ -243,7 +250,9 @@ impl App {
             git: GitData::default(),
             git_schedule: ScanSchedule::default(),
             diagnostics: DiagnosticsData::default(),
-            diagnostics_origin: None,
+            diagnostic_sources: Sources::default(),
+            pid_alive: diagnostics::process_alive,
+            diagnostics_prune_at: None,
             diagnostics_mode: diagnostics::Mode::parse(&config.diagnostics).unwrap_or_else(|| {
                 eprintln!(
                     "treelix: unknown diagnostics = \"{}\" (off | errors | warnings); using warnings",
@@ -322,19 +331,25 @@ impl App {
             });
         }
 
+        let mut redraw = true;
         loop {
-            self.draw(terminal)?;
-            // Compute the next self-scheduled wake, if any. Two timers can fire
-            // with no incoming event:
+            if redraw {
+                self.draw(terminal)?;
+            }
+            // Compute the next self-scheduled wake, if any. Three timers can
+            // fire with no incoming event:
             //   - a transient status message that must auto-clear;
             //   - a deferred follow-reveal that must be applied once the input
             //     grace window lapses (otherwise it waits, possibly forever,
-            //     for an unrelated event and then applies out of order).
+            //     for an unrelated event and then applies out of order);
+            //   - a liveness check of the editors whose marks are on display,
+            //     so an editor killed without a farewell does not leave them.
             // Wake at whichever is sooner.
             let wake = self
                 .status_deadline
                 .into_iter()
                 .chain(self.pending_reveal_deadline())
+                .chain(self.diagnostics_prune_at)
                 .min();
             let received = match wake {
                 Some(deadline) => self
@@ -342,27 +357,43 @@ impl App {
                     .recv_timeout(deadline.saturating_duration_since(Instant::now())),
                 None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
-            match received {
-                Ok(ev) => self.handle_event(ev),
-                Err(RecvTimeoutError::Timeout) => {
-                    // A timer fired. Clear an expired status, and flush a
-                    // now-eligible deferred reveal (grace window lapsed).
-                    if self.status_deadline.is_some_and(|d| Instant::now() >= d) {
-                        self.clear_status();
-                    }
-                    if self.pending_reveal.is_some() && !self.recent_input() {
-                        if let Some(path) = self.pending_reveal.take() {
-                            self.reveal(&path);
-                        }
-                    }
+            redraw = match received {
+                Ok(ev) => {
+                    self.handle_event(ev);
+                    true
                 }
+                // A timer that changed nothing (an editor checked and found
+                // alive) must not repaint an idle sidebar.
+                Err(RecvTimeoutError::Timeout) => self.on_timeout(Instant::now()),
                 Err(RecvTimeoutError::Disconnected) => break,
-            }
+            };
             if self.should_quit {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// A timer fired. Clear an expired status, flush a now-eligible deferred
+    /// reveal (grace window lapsed), and check the editors behind the marks.
+    /// Returns whether anything on screen may have changed.
+    fn on_timeout(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self.status_deadline.is_some_and(|d| now >= d) {
+            self.clear_status();
+            changed = true;
+        }
+        if self.pending_reveal.is_some() && !self.recent_input() {
+            if let Some(path) = self.pending_reveal.take() {
+                self.reveal(&path);
+                changed = true;
+            }
+        }
+        if self.diagnostics_prune_at.is_some_and(|d| now >= d) {
+            self.diagnostics_prune_at = None;
+            changed |= self.sources_changed(false);
+        }
+        changed
     }
 
     /// When a deferred follow-reveal is pending, the instant its input grace
@@ -438,54 +469,34 @@ impl App {
                     return;
                 }
                 let path = self.path_mapper().map(&path);
-                if self.diagnostics.update(path, counts) {
-                    self.diagnostics_changed();
-                }
+                let applied = self.diagnostic_sources.single(path, counts);
+                self.sources_changed(applied);
             }
             AppEvent::DiagnosticsSnapshot { sender, seq, files } => {
                 if self.diagnostics_mode == diagnostics::Mode::Off {
                     return;
                 }
-                if let Some((last_sender, last_seq)) = &self.diagnostics_origin {
-                    if *last_sender == sender && seq <= *last_seq {
-                        return;
-                    }
-                }
-                self.diagnostics_origin = Some((sender, seq));
                 let mut mapper = self.path_mapper();
                 let files: Vec<_> = files
                     .into_iter()
                     .map(|(path, counts)| (mapper.map(&path), counts))
                     .collect();
-                if self.diagnostics.replace(files) {
-                    self.diagnostics_changed();
-                }
+                let applied = self.diagnostic_sources.snapshot(sender, seq, files);
+                self.sources_changed(applied);
             }
             AppEvent::DiagnosticsBye { sender, seq } => {
                 if self.diagnostics_mode == diagnostics::Mode::Off {
                     return;
                 }
-                // Only the editor whose snapshot is on display may retract
-                // it: two editors can share one sidebar (the hx() wrapper
-                // exports the session socket to every hx in it), and a
-                // secondary one exiting must not wipe the primary's markers.
-                // Otherwise this is an empty snapshot under the same ordering
-                // rules, and the origin is KEPT at the new seq rather than
-                // cleared: a snapshot from this sender still in flight on
-                // another connection is then rejected as stale instead of
-                // repainting what was just cleared. Sender ids embed pid and
-                // start time, so a dead sender never returns to be wrongly
-                // rejected.
-                let Some((last_sender, last_seq)) = &self.diagnostics_origin else {
-                    return;
-                };
-                if *last_sender != sender || seq <= *last_seq {
-                    return;
-                }
-                self.diagnostics_origin = Some((sender, seq));
-                if self.diagnostics.replace(std::iter::empty()) {
-                    self.diagnostics_changed();
-                }
+                // Retracts only this editor's snapshot: two editors can share
+                // one sidebar (the hx() wrapper exports the tab's socket to
+                // every hx started in it), and one exiting must not wipe the
+                // other's markers. The sender stays as a tombstone at the new
+                // seq, so a snapshot from it still in flight on another
+                // connection is rejected as stale instead of repainting what
+                // was just cleared.
+                let applied = self.diagnostic_sources.bye(sender, seq);
+                self.sources_changed(applied);
             }
             AppEvent::Reveal(ipc::Reveal { path, follow }) => {
                 // Bring the incoming path into the tree's canonical namespace
@@ -1611,6 +1622,29 @@ impl App {
             root_real,
             memo: HashMap::new(),
         }
+    }
+
+    /// How often the editors behind the marks are checked while some are on
+    /// display: the longest a killed editor's marks can linger.
+    const DIAGNOSTICS_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// After a diagnostics event (`applied`: `Sources` took it) or a prune
+    /// tick: drop senders whose editor is gone, show the union if anything
+    /// may have changed, and keep the liveness timer armed while it matters.
+    /// Returns whether the diagnostics on display changed.
+    fn sources_changed(&mut self, applied: bool) -> bool {
+        let pruned = self.diagnostic_sources.prune(self.pid_alive);
+        let changed =
+            (applied || pruned) && self.diagnostics.replace(self.diagnostic_sources.merged());
+        if changed {
+            self.diagnostics_changed();
+        }
+        if !self.diagnostic_sources.has_live_marks() {
+            self.diagnostics_prune_at = None;
+        } else if self.diagnostics_prune_at.is_none() {
+            self.diagnostics_prune_at = Some(Instant::now() + Self::DIAGNOSTICS_PRUNE_INTERVAL);
+        }
+        changed
     }
 
     /// The diagnostics set changed: recolor and redraw.
@@ -2752,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn a_different_sender_is_applied_whatever_its_sequence() {
+    fn each_sender_keeps_its_marks_whatever_another_sends() {
         use crate::diagnostics::{Counts, Severity};
         let (mut app, root, _) = app_with_tree();
         let a = root.join("a.txt");
@@ -2760,40 +2794,159 @@ mod tests {
             errors: e,
             warnings: w,
         };
+        app.pid_alive = |_| true;
         app.handle_event(AppEvent::DiagnosticsSnapshot {
-            sender: "hx-old".into(),
+            sender: "hx-100-1".into(),
             seq: 900,
             files: vec![(a.clone(), counts(1, 0))],
         });
         assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
-        // A restarted editor starts counting again; its (lower) seq still wins.
+        // A second editor (a restart, or an hx started in a shell) counts from
+        // 1; its empty first snapshot applies but cannot hide the first
+        // editor's error.
         app.handle_event(AppEvent::DiagnosticsSnapshot {
-            sender: "hx-new".into(),
+            sender: "hx-200-1".into(),
+            seq: 1,
+            files: vec![],
+        });
+        assert_eq!(
+            diag_of(&app, &a).map(|d| d.severity),
+            Some(Severity::Error),
+            "the other sender's empty set does not clear this one's"
+        );
+        // The new sender's own ordering holds.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-200-1".into(),
+            seq: 2,
+            files: vec![(root.join("sub/deep.txt"), counts(0, 1))],
+        });
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-200-1".into(),
+            seq: 2,
+            files: vec![],
+        });
+        assert_eq!(
+            diag_of(&app, &root.join("sub")).map(|d| d.severity),
+            Some(Severity::Warning),
+            "same seq from the same sender: ignored"
+        );
+        // The first editor's error goes only with its own farewell...
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-200-1".into(),
+            seq: 3,
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        assert_eq!(diag_of(&app, &root.join("sub")), None);
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-100-1".into(),
+            seq: 901,
+        });
+        assert_eq!(diag_of(&app, &a), None, "its own farewell clears it");
+
+        // ...or once its process is gone.
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-300-1".into(),
+            seq: 1,
+            files: vec![(a.clone(), counts(1, 0))],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        app.pid_alive = |pid| pid != 300;
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-400-1".into(),
             seq: 1,
             files: vec![],
         });
         assert_eq!(
             diag_of(&app, &a),
             None,
-            "the new sender's empty set applied"
-        );
-        // And from now on the new sender's own ordering holds.
-        app.handle_event(AppEvent::DiagnosticsSnapshot {
-            sender: "hx-new".into(),
-            seq: 1,
-            files: vec![(a.clone(), counts(0, 1))],
-        });
-        assert_eq!(
-            diag_of(&app, &a),
-            None,
-            "same seq from the same sender: ignored"
+            "a dead sender is pruned on the next diagnostics event"
         );
     }
 
     #[test]
-    fn a_farewell_from_the_displayed_editor_clears_everything() {
+    fn a_farewell_keeps_the_other_editors_folder_color() {
         use crate::diagnostics::{Counts, Severity};
         let (mut app, root, deep) = app_with_tree();
+        let sub = root.join("sub");
+        let a = root.join("a.txt");
+        let counts = |e, w| Counts {
+            errors: e,
+            warnings: w,
+        };
+        app.pid_alive = |_| true;
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-100-1".into(),
+            seq: 4,
+            files: vec![(deep.clone(), counts(0, 2))],
+        });
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-200-1".into(),
+            seq: 1,
+            files: vec![(deep.clone(), counts(1, 0)), (a.clone(), counts(1, 0))],
+        });
+        assert_eq!(
+            diag_of(&app, &sub).map(|d| d.severity),
+            Some(Severity::Error),
+            "the union shows the worst of both"
+        );
+        app.handle_event(AppEvent::DiagnosticsBye {
+            sender: "hx-200-1".into(),
+            seq: 2,
+        });
+        assert_eq!(diag_of(&app, &a), None, "the leaving editor's file clears");
+        assert_eq!(
+            diag_of(&app, &sub).map(|d| d.severity),
+            Some(Severity::Warning),
+            "the folder keeps the remaining editor's warning"
+        );
+    }
+
+    #[test]
+    fn the_prune_timer_clears_a_dead_editors_marks() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, _) = app_with_tree();
+        let a = root.join("a.txt");
+        app.pid_alive = |_| true;
+        assert_eq!(app.diagnostics_prune_at, None, "idle with no marks");
+        app.handle_event(AppEvent::DiagnosticsSnapshot {
+            sender: "hx-100-1".into(),
+            seq: 1,
+            files: vec![(
+                a.clone(),
+                Counts {
+                    errors: 1,
+                    warnings: 0,
+                },
+            )],
+        });
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        let deadline = app.diagnostics_prune_at.expect("armed while marks exist");
+
+        // Not yet due: nothing is checked.
+        app.pid_alive = |_| false;
+        app.on_timeout(deadline - Duration::from_millis(1));
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        assert_eq!(app.diagnostics_prune_at, Some(deadline));
+
+        // Due while the editor is alive: the marks stay and the timer rearms.
+        app.pid_alive = |_| true;
+        app.on_timeout(deadline);
+        assert_eq!(diag_of(&app, &a).map(|d| d.severity), Some(Severity::Error));
+        let next = app.diagnostics_prune_at.expect("rearmed");
+
+        // Due after the editor died without a farewell (SIGKILL, or an
+        // editor too old to send one): cleared, and the timer goes idle.
+        app.pid_alive = |_| false;
+        app.on_timeout(next);
+        assert_eq!(diag_of(&app, &a), None);
+        assert_eq!(app.diagnostics_prune_at, None, "nothing left to check");
+    }
+
+    #[test]
+    fn a_farewell_retracts_every_mark_of_its_own_sender() {
+        use crate::diagnostics::{Counts, Severity};
+        let (mut app, root, deep) = app_with_tree();
+        app.pid_alive = |_| true;
         let a = root.join("a.txt");
         let sub = root.join("sub");
         let counts = |e, w| Counts {

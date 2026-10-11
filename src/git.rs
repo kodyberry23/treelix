@@ -233,6 +233,35 @@ pub struct GitData {
     pub toplevel: Option<PathBuf>,
     /// Absolute path -> effective status.
     pub statuses: HashMap<PathBuf, GitStatus>,
+    /// Directory -> worst status of any reported path below it, up to and
+    /// including the top-level. Derived once per scan, so coloring a folder
+    /// (loaded or not) is one lookup on every overlay pass. `Ignored` never
+    /// climbs: git names an ignored directory by its own path, and an
+    /// ignored leaf must not color or hide the package that holds it.
+    pub dirs: HashMap<PathBuf, GitStatus>,
+}
+
+impl GitData {
+    pub fn new(toplevel: Option<PathBuf>, statuses: HashMap<PathBuf, GitStatus>) -> Self {
+        let mut dirs: HashMap<PathBuf, GitStatus> = HashMap::new();
+        for (path, status) in &statuses {
+            if *status == GitStatus::Ignored {
+                continue;
+            }
+            for dir in path.ancestors().skip(1) {
+                let slot = dirs.entry(dir.to_path_buf()).or_insert(*status);
+                *slot = (*slot).max(*status);
+                if toplevel.as_deref() == Some(dir) {
+                    break;
+                }
+            }
+        }
+        GitData {
+            toplevel,
+            statuses,
+            dirs,
+        }
+    }
 }
 
 /// Discover the git top-level for `root`, or `None` if not a repo.
@@ -310,10 +339,7 @@ pub fn scan(root: &Path) -> Option<GitData> {
     let out = run_capture(cmd, GIT_TIMEOUT)?;
     let mut statuses = HashMap::new();
     parse_porcelain_z(&out, &top, &mut statuses);
-    Some(GitData {
-        toplevel: Some(top),
-        statuses,
-    })
+    Some(GitData::new(Some(top), statuses))
 }
 
 /// Parse NUL-separated `git status --porcelain=v1 -z` output.

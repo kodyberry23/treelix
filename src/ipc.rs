@@ -15,25 +15,27 @@
 //!                             — a complete snapshot: the `diagnostics` lines in
 //!                               between are every file that has any, applied
 //!                               atomically at `end`; files not listed are
-//!                               clear. `seq` grows with each snapshot a sender
-//!                               produces; `sender` identifies the editor
-//!                               process. A snapshot from the last sender that
-//!                               is not newer than the one applied is ignored
+//!                               clear. `sender` identifies the editor process
+//!                               (`hx-<pid>-<start>`; omitted by older editors,
+//!                               which then share the legacy sender ""), and
+//!                               `seq` grows with each snapshot it produces.
+//!                               Snapshots are kept per sender: one not newer
+//!                               than that sender's last is ignored
 //!                               (connections are served on separate threads),
-//!                               while a snapshot from another sender is
-//!                               always applied, so a restarted editor takes
-//!                               over at once. This is what the patched Helix
-//!                               sends.
+//!                               while a sender's first is always applied, so a
+//!                               restarted editor shows at once. The tree shows
+//!                               the union of every sender's files. This is
+//!                               what the patched Helix sends.
 //!   `diagnostics-bye <sender> <seq>`
 //!                             — the editor is exiting: retract its snapshot.
-//!                               An empty snapshot under the same ordering
-//!                               rules, except that it applies only when
-//!                               `sender` is the sender whose snapshot is on
-//!                               display; two editors can share one sidebar,
-//!                               and one leaving must not wipe the other's
-//!                               markers. Helix appends it to its final
+//!                               An empty snapshot for that sender only, under
+//!                               the same ordering rules; two editors can share
+//!                               one sidebar, and one leaving must not wipe the
+//!                               other's markers. Helix appends it to its final
 //!                               snapshot on one connection, so the two are
-//!                               always read in order.
+//!                               always read in order. A sender whose process
+//!                               has exited without a farewell is pruned (see
+//!                               `diagnostics::Sources`).
 //! The path is taken verbatim up to the newline (no trimming — trailing
 //! whitespace is legal in file names).
 
@@ -133,8 +135,10 @@ fn fold_line(batch: &mut Option<Batch>, line: Line) -> Option<Message> {
     }
 }
 
-/// Resolve the per-session reveal socket path, matching the dotfiles'
-/// `launch-sidebar.sh`/`dispatch-to-sidebar.sh` derivation.
+/// The reveal socket path: `TREELIX_SOCKET_PATH` when set, otherwise a
+/// per-session path. The helix-files launchers always export the per-tab path,
+/// so the session-level derivation here is only the fallback when no
+/// environment is set (treelix run outside the launchers).
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("TREELIX_SOCKET_PATH") {
         if !p.is_empty() {

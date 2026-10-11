@@ -1,14 +1,19 @@
 //! LSP diagnostics pushed by the editor, shown as file-name colors.
 //!
 //! The patched Helix sends its diagnostics over the reveal socket (see
-//! `ipc.rs`): normally a whole snapshot (`diagnostics-begin <seq>`, one
-//! `diagnostics <errors> <warnings> <abspath>` line per file that has any,
+//! `ipc.rs`): normally a whole snapshot (`diagnostics-begin <sender> <seq>`,
+//! one `diagnostics <errors> <warnings> <abspath>` line per file that has any,
 //! `diagnostics-end <seq>`), for every file its language servers report on,
-//! open in a buffer or not. treelix keeps the counts per file, colors the name
-//! by the worst severity, and colors every ancestor directory by the worst
-//! severity below it, so a problem inside a collapsed folder is still visible.
-//! Paths are expected canonical (the app canonicalizes them on arrival, as it
-//! does for reveals), because tree nodes are keyed by canonical paths.
+//! open in a buffer or not. Several editors can push to one sidebar (the pane
+//! beside it plus any `hx` started in a shell of the same tab), so `Sources`
+//! keeps the latest snapshot of each sender and the tree shows their union.
+//! An exiting editor's `diagnostics-bye` retracts only its own snapshot, and a
+//! sender whose process is gone (killed, or too old to say goodbye) is pruned.
+//! treelix keeps the counts per file, colors the name by the worst severity,
+//! and colors every ancestor directory by the worst severity below it, so a
+//! problem inside a collapsed folder is still visible. Paths are expected
+//! canonical (the app canonicalizes them on arrival, as it does for reveals),
+//! because tree nodes are keyed by canonical paths.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,7 +116,7 @@ struct Below {
 /// the editor may know a file by different casing than the directory listing
 /// (TypeScript imports and `hx SRC/file` resolve case-insensitively). Without
 /// folding, the folder colors (ancestor tallies match) while the file itself
-/// misses its exact-match lookup — a folder stuck red with a plain file in it.
+/// misses its exact-match lookup: a folder stuck red with a plain file in it.
 #[derive(Default, Debug)]
 pub struct DiagnosticsData {
     files: HashMap<PathBuf, Counts>,
@@ -213,6 +218,171 @@ impl DiagnosticsData {
         };
         Some(Diag { severity, count: 0 })
     }
+}
+
+/// The latest diagnostics of every editor pushing to this sidebar.
+///
+/// Each sender's snapshots are ordered by its own `seq`; senders never order
+/// against each other, because each counts from 1 in its own process. What the
+/// tree shows is `merged`, the union of every sender's files.
+#[derive(Default, Debug)]
+pub struct Sources {
+    senders: HashMap<String, Source>,
+}
+
+/// One sender's latest state.
+#[derive(Debug)]
+struct Source {
+    /// The newest snapshot or farewell applied; `None` while the legacy
+    /// sender has only sent bare lines. Anything not newer is a straggler
+    /// served late on another connection and is ignored.
+    seq: Option<u64>,
+    /// Its files with any diagnostics, keyed by `fold(path)`. Empty after a
+    /// farewell: the entry then stays as a tombstone so a straggler cannot
+    /// repaint what the farewell cleared.
+    files: HashMap<PathBuf, Counts>,
+    /// The editor's process, from a sender id of the form `hx-<pid>-<start>`.
+    /// `None` (the legacy sender `""`, or an id in another form) is never
+    /// pruned, because there is no process to check.
+    pid: Option<u32>,
+}
+
+/// The pid in a Helix sender id (`hx-<pid>-<start>`), if it has that form and
+/// names a real process id. Pid 0 and values beyond `pid_t` are rejected:
+/// `kill` would read them as a process group, not a process.
+fn sender_pid(sender: &str) -> Option<u32> {
+    let (pid, start) = sender.strip_prefix("hx-")?.split_once('-')?;
+    if start.is_empty() || !start.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = pid.parse().ok()?;
+    (pid > 0 && i32::try_from(pid).is_ok()).then_some(pid)
+}
+
+/// Fold and keep only files that have something to show. A file listed twice
+/// keeps its worst counts.
+fn fold_files(files: impl IntoIterator<Item = (PathBuf, Counts)>) -> HashMap<PathBuf, Counts> {
+    let mut folded = HashMap::new();
+    for (path, counts) in files {
+        if !counts.is_empty() {
+            merge_max(&mut folded, fold(&path), counts);
+        }
+    }
+    folded
+}
+
+/// Record `counts` for `key`, keeping the larger error and warning counts.
+fn merge_max(into: &mut HashMap<PathBuf, Counts>, key: PathBuf, counts: Counts) {
+    let slot = into.entry(key).or_default();
+    slot.errors = slot.errors.max(counts.errors);
+    slot.warnings = slot.warnings.max(counts.warnings);
+}
+
+impl Sources {
+    /// Apply a complete snapshot from `sender`. A sender's first snapshot is
+    /// always accepted (a restarted editor counts from 1 again under a new
+    /// id); after that only a newer `seq` is. Returns whether it was applied.
+    pub fn snapshot(&mut self, sender: String, seq: u64, files: Vec<(PathBuf, Counts)>) -> bool {
+        if self
+            .senders
+            .get(&sender)
+            .and_then(|source| source.seq)
+            .is_some_and(|last| seq <= last)
+        {
+            return false;
+        }
+        let pid = sender_pid(&sender);
+        let files = fold_files(files);
+        self.senders.insert(
+            sender,
+            Source {
+                seq: Some(seq),
+                files,
+                pid,
+            },
+        );
+        true
+    }
+
+    /// `sender` is exiting: clear its files and leave a tombstone at `seq`,
+    /// under the same ordering as a snapshot. Other senders are untouched. A
+    /// farewell from a sender never seen still leaves the tombstone, so its
+    /// snapshot arriving late on another connection is rejected. Returns
+    /// whether it was applied.
+    pub fn bye(&mut self, sender: String, seq: u64) -> bool {
+        self.snapshot(sender, seq, Vec::new())
+    }
+
+    /// A bare `diagnostics` line (an older editor without snapshots): update
+    /// one file of the legacy sender `""`. Returns whether that changed it.
+    pub fn single(&mut self, path: PathBuf, counts: Counts) -> bool {
+        let source = self.senders.entry(String::new()).or_insert(Source {
+            seq: None,
+            files: HashMap::new(),
+            pid: None,
+        });
+        let key = fold(&path);
+        if counts.is_empty() {
+            source.files.remove(&key).is_some()
+        } else {
+            source.files.insert(key, counts) != Some(counts)
+        }
+    }
+
+    /// Drop every sender whose process `alive` says is gone, files and
+    /// tombstone alike. Returns whether a dropped sender had files, that is,
+    /// whether `merged` may have changed.
+    pub fn prune(&mut self, alive: impl Fn(u32) -> bool) -> bool {
+        let mut shown = false;
+        self.senders.retain(|_, source| {
+            let keep = source.pid.is_none_or(&alive);
+            shown |= !keep && !source.files.is_empty();
+            keep
+        });
+        shown
+    }
+
+    /// The union of every sender's files, keyed by folded path. Per file it
+    /// takes the larger error and warning counts, not their sum: two editors
+    /// on one workspace each run their own language server and report the
+    /// same diagnostics, which a sum would double.
+    pub fn merged(&self) -> Vec<(PathBuf, Counts)> {
+        let mut union = HashMap::new();
+        for source in self.senders.values() {
+            for (path, counts) in &source.files {
+                merge_max(&mut union, path.clone(), *counts);
+            }
+        }
+        union.into_iter().collect()
+    }
+
+    /// Whether any sender that can be pruned has files on display, which is
+    /// when the app needs its periodic liveness check.
+    pub fn has_live_marks(&self) -> bool {
+        self.senders
+            .values()
+            .any(|source| source.pid.is_some() && !source.files.is_empty())
+    }
+}
+
+/// Whether process `pid` exists. `kill(pid, 0)` delivers nothing and only
+/// checks: success or `EPERM` (it exists but belongs to another user) means
+/// it is running. A zombie (exited, not yet reaped by its parent) also answers,
+/// which does not arise under zellij, where the pane's shell reaps at once.
+/// A recycled pid reads as alive, so a dead editor's marks can
+/// outlive it until the process that took its pid exits too.
+pub fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(test)]
@@ -390,5 +560,213 @@ mod tests {
         );
         assert!(data.replace(Vec::new()), "emptying is a change");
         assert!(data.dirs.is_empty());
+    }
+
+    fn file(path: &str, errors: u32, warnings: u32) -> (PathBuf, Counts) {
+        (PathBuf::from(path), counts(errors, warnings))
+    }
+
+    /// `merged` as a sorted list, for comparisons.
+    fn union(sources: &Sources) -> Vec<(PathBuf, Counts)> {
+        let mut merged = sources.merged();
+        merged.sort_by(|a, b| a.0.cmp(&b.0));
+        merged
+    }
+
+    #[test]
+    fn sender_ids_name_a_pid_only_in_the_helix_form() {
+        assert_eq!(sender_pid("hx-4242-1760000000000000"), Some(4242));
+        assert_eq!(sender_pid(""), None, "legacy sender");
+        assert_eq!(sender_pid("hx-1"), None, "no start time");
+        assert_eq!(sender_pid("hx-old"), None);
+        assert_eq!(sender_pid("hx-12-"), None);
+        assert_eq!(sender_pid("hx-12-3x"), None);
+        assert_eq!(sender_pid("hx-0-1"), None, "pid 0 is a process group");
+        assert_eq!(
+            sender_pid("hx-4294967295-1"),
+            None,
+            "beyond pid_t would be a negative pid"
+        );
+        assert_eq!(sender_pid("vim-12-1"), None);
+    }
+
+    #[test]
+    fn this_process_is_alive_and_a_reaped_child_is_not() {
+        assert!(process_alive(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_alive(pid), "a reaped child no longer exists");
+        assert!(!process_alive(0), "never a process group");
+        assert!(!process_alive(u32::MAX));
+    }
+
+    #[test]
+    fn the_union_keeps_the_larger_counts_not_their_sum() {
+        let mut sources = Sources::default();
+        assert!(sources.snapshot(
+            "hx-1-1".into(),
+            1,
+            vec![file("/r/a.rs", 2, 0), file("/r/b.rs", 0, 1)],
+        ));
+        assert!(sources.snapshot(
+            "hx-2-1".into(),
+            1,
+            vec![file("/r/a.rs", 2, 3), file("/r/c.rs", 1, 0)],
+        ));
+        assert_eq!(
+            union(&sources),
+            vec![
+                file("/r/a.rs", 2, 3),
+                file("/r/b.rs", 0, 1),
+                file("/r/c.rs", 1, 0),
+            ],
+            "the same file reported twice is not doubled"
+        );
+    }
+
+    #[test]
+    fn senders_merge_on_the_folded_path() {
+        let mut sources = Sources::default();
+        sources.snapshot("hx-1-1".into(), 1, vec![file("/r/src/Header.tsx", 1, 0)]);
+        sources.snapshot("hx-2-1".into(), 1, vec![file("/r/src/header.tsx", 0, 2)]);
+        sources.snapshot(
+            "hx-3-1".into(),
+            1,
+            vec![file("/r/src/cafe\u{301}.rs", 1, 0)],
+        );
+        sources.snapshot("hx-4-1".into(), 1, vec![file("/r/src/caf\u{e9}.rs", 3, 0)]);
+        assert_eq!(
+            union(&sources),
+            vec![
+                file("/r/src/caf\u{e9}.rs", 3, 0),
+                file("/r/src/header.tsx", 1, 2),
+            ],
+            "case and normalization variants are one file"
+        );
+    }
+
+    #[test]
+    fn each_sender_orders_only_its_own_snapshots() {
+        let mut sources = Sources::default();
+        assert!(sources.snapshot("hx-1-1".into(), 900, vec![file("/r/a.rs", 1, 0)]));
+        assert!(
+            sources.snapshot("hx-2-1".into(), 1, Vec::new()),
+            "another sender's first snapshot applies whatever its seq"
+        );
+        assert_eq!(union(&sources), vec![file("/r/a.rs", 1, 0)]);
+        assert!(!sources.snapshot("hx-2-1".into(), 1, vec![file("/r/b.rs", 1, 0)]));
+        assert!(!sources.snapshot("hx-1-1".into(), 899, Vec::new()));
+        assert!(sources.snapshot("hx-2-1".into(), 2, vec![file("/r/b.rs", 0, 1)]));
+        assert_eq!(
+            union(&sources),
+            vec![file("/r/a.rs", 1, 0), file("/r/b.rs", 0, 1)]
+        );
+    }
+
+    #[test]
+    fn a_farewell_retracts_only_its_own_sender() {
+        let mut sources = Sources::default();
+        sources.snapshot("hx-1-1".into(), 3, vec![file("/r/a.rs", 1, 0)]);
+        sources.snapshot("hx-2-1".into(), 7, vec![file("/r/b.rs", 0, 1)]);
+        assert!(sources.bye("hx-2-1".into(), 8));
+        assert_eq!(union(&sources), vec![file("/r/a.rs", 1, 0)]);
+        assert!(
+            !sources.bye("hx-1-1".into(), 3),
+            "a farewell not newer than the snapshot is stale"
+        );
+        assert_eq!(union(&sources), vec![file("/r/a.rs", 1, 0)]);
+        assert!(sources.bye("hx-1-1".into(), 4));
+        assert!(sources.merged().is_empty());
+    }
+
+    #[test]
+    fn a_straggler_after_a_farewell_is_rejected() {
+        let mut sources = Sources::default();
+        sources.snapshot("hx-1-1".into(), 2, vec![file("/r/a.rs", 1, 0)]);
+        sources.bye("hx-1-1".into(), 3);
+        assert!(
+            !sources.snapshot("hx-1-1".into(), 2, vec![file("/r/a.rs", 1, 0)]),
+            "the superseded snapshot arriving late"
+        );
+        assert!(sources.merged().is_empty());
+
+        // A farewell that overtook the sender's only snapshot still wins.
+        assert!(sources.bye("hx-9-1".into(), 2));
+        assert!(!sources.snapshot("hx-9-1".into(), 1, vec![file("/r/z.rs", 1, 0)]));
+        assert!(sources.merged().is_empty());
+    }
+
+    #[test]
+    fn prune_drops_a_dead_senders_files_and_tombstone() {
+        let mut sources = Sources::default();
+        sources.snapshot("hx-10-1".into(), 1, vec![file("/r/a.rs", 1, 0)]);
+        sources.snapshot("hx-20-1".into(), 1, vec![file("/r/b.rs", 1, 0)]);
+        sources.bye("hx-30-1".into(), 5);
+        assert!(sources.has_live_marks());
+        assert!(!sources.prune(|_| true), "everyone alive: nothing dropped");
+
+        assert!(sources.prune(|pid| pid != 10), "a sender with files died");
+        assert_eq!(union(&sources), vec![file("/r/b.rs", 1, 0)]);
+        assert!(
+            !sources.prune(|pid| pid == 20),
+            "dropping only a tombstone changes nothing on display"
+        );
+        assert!(
+            !sources.senders.contains_key("hx-30-1"),
+            "the tombstone went with its process"
+        );
+        assert!(sources.prune(|_| false));
+        assert!(!sources.has_live_marks());
+        assert!(sources.senders.is_empty());
+    }
+
+    #[test]
+    fn senders_without_a_pid_are_never_pruned() {
+        let mut sources = Sources::default();
+        sources.snapshot(String::new(), 1, vec![file("/r/a.rs", 1, 0)]);
+        sources.snapshot("hx-1".into(), 1, vec![file("/r/b.rs", 1, 0)]);
+        assert!(
+            !sources.has_live_marks(),
+            "nothing to check, so no timer is needed"
+        );
+        assert!(!sources.prune(|_| false));
+        assert_eq!(
+            union(&sources),
+            vec![file("/r/a.rs", 1, 0), file("/r/b.rs", 1, 0)]
+        );
+    }
+
+    #[test]
+    fn bare_lines_update_the_legacy_sender() {
+        let mut sources = Sources::default();
+        assert!(sources.single(PathBuf::from("/r/a.rs"), counts(1, 0)));
+        assert!(
+            !sources.single(PathBuf::from("/r/A.rs"), counts(1, 0)),
+            "same file, same counts"
+        );
+        assert!(sources.single(PathBuf::from("/r/b.rs"), counts(0, 2)));
+        assert!(
+            !sources.single(PathBuf::from("/r/c.rs"), counts(0, 0)),
+            "clearing an unknown file"
+        );
+        assert_eq!(
+            union(&sources),
+            vec![file("/r/a.rs", 1, 0), file("/r/b.rs", 0, 2)]
+        );
+        assert!(sources.single(PathBuf::from("/r/a.rs"), counts(0, 0)));
+        assert_eq!(union(&sources), vec![file("/r/b.rs", 0, 2)]);
+
+        // A legacy snapshot (no sender) replaces the bare lines, and its
+        // first one applies even at seq 0.
+        assert!(sources.snapshot(String::new(), 0, vec![file("/r/c.rs", 1, 0)]));
+        assert_eq!(union(&sources), vec![file("/r/c.rs", 1, 0)]);
+        assert!(!sources.snapshot(String::new(), 0, Vec::new()));
+        // Another sender's union still includes the legacy files.
+        sources.snapshot("hx-5-1".into(), 1, vec![file("/r/d.rs", 0, 1)]);
+        assert_eq!(
+            union(&sources),
+            vec![file("/r/c.rs", 1, 0), file("/r/d.rs", 0, 1)]
+        );
     }
 }

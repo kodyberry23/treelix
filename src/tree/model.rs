@@ -432,28 +432,35 @@ impl Tree {
         target.exists()
     }
 
-    /// Apply git statuses to file nodes and propagate to directories.
+    /// Apply git statuses to file nodes and propagate to directories. A
+    /// directory takes the worst status of every path git reported below it,
+    /// loaded or not, so a collapsed folder still shows that a file inside it
+    /// is modified (the same rule `apply_diagnostics` uses).
     pub fn apply_git(&mut self, data: &GitData) {
-        fn walk(n: &mut Node, statuses: &HashMap<PathBuf, GitStatus>) -> Option<GitStatus> {
+        // `data.dirs` holds the worst reported status under each directory,
+        // derived once per scan (see `GitData::new`).
+        let below = &data.dirs;
+        fn walk(
+            n: &mut Node,
+            statuses: &HashMap<PathBuf, GitStatus>,
+            below: &HashMap<PathBuf, GitStatus>,
+        ) -> Option<GitStatus> {
             if !n.is_dir() {
                 n.git = statuses.get(&n.path).copied();
                 return n.git;
             }
-            let mut best = statuses.get(&n.path).copied();
+            let own = statuses.get(&n.path).copied();
+            let under = below.get(&n.path).copied();
+            n.git = match (own, under) {
+                (Some(o), Some(u)) => Some(o.max(u)),
+                (own, under) => own.or(under),
+            };
             for c in &mut n.children {
-                if let Some(s) = walk(c, statuses) {
-                    if s != GitStatus::Ignored {
-                        best = Some(best.map_or(s, |b| b.max(s)));
-                    }
-                    // Never let a child's Ignored status change the parent's; a
-                    // directory is Ignored only if git reported its OWN path as
-                    // Ignored (captured in `best` from statuses.get(&n.path) above).
-                }
+                walk(c, statuses, below);
             }
-            n.git = best;
-            best
+            n.git
         }
-        walk(&mut self.root, &data.statuses);
+        walk(&mut self.root, &data.statuses, below);
     }
 
     /// Apply editor diagnostics to file nodes and propagate the worst severity
@@ -733,10 +740,7 @@ mod tests {
 
         let mut statuses = HashMap::new();
         statuses.insert(d.join("build"), GitStatus::Ignored);
-        let data = GitData {
-            toplevel: Some(d.clone()),
-            statuses,
-        };
+        let data = GitData::new(Some(d.clone()), statuses);
         tree.apply_git(&data);
 
         let mut opts = ViewOptions::default();
@@ -744,6 +748,56 @@ mod tests {
         assert!(tree.flatten(&opts).iter().any(|r| r.name == "keep.txt"));
         opts.show_ignored = true;
         assert!(tree.flatten(&opts).iter().any(|r| r.name == "build"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn collapsed_dir_shows_the_worst_status_reported_below_it() {
+        // A modified file inside a folder that was never expanded still colors
+        // the folder: git reports the file's path, and the tree must not need
+        // the child node to exist to know it.
+        let d = tmpdir("collapsed-git");
+        fs::create_dir_all(d.join("docs/deep")).unwrap();
+        fs::write(d.join("docs/deep/notes.txt"), b"x").unwrap();
+        fs::write(d.join("docs/extra.txt"), b"x").unwrap();
+        let d = fs::canonicalize(&d).unwrap();
+        let mut tree = Tree::new(d.clone());
+
+        let mut statuses = HashMap::new();
+        statuses.insert(d.join("docs/deep/notes.txt"), GitStatus::Dirty);
+        statuses.insert(d.join("docs/extra.txt"), GitStatus::Untracked);
+        let data = GitData::new(Some(d.clone()), statuses);
+        tree.apply_git(&data);
+        let docs = tree.root.find_mut(&d.join("docs")).unwrap();
+        assert!(!docs.loaded, "docs was never expanded");
+        assert_eq!(
+            docs.git,
+            Some(GitStatus::Dirty),
+            "the worst status below wins"
+        );
+
+        // Expanding later agrees with what the collapsed folder said, and the
+        // nested folder is colored by the same rule.
+        tree.expand(&d.join("docs"));
+        tree.apply_git(&data);
+        assert_eq!(
+            tree.root.find_mut(&d.join("docs")).unwrap().git,
+            Some(GitStatus::Dirty)
+        );
+        assert_eq!(
+            tree.root.find_mut(&d.join("docs/deep")).unwrap().git,
+            Some(GitStatus::Dirty)
+        );
+        assert_eq!(
+            tree.root.find_mut(&d.join("docs/extra.txt")).unwrap().git,
+            Some(GitStatus::Untracked)
+        );
+
+        // Once the file is committed, nothing below is reported and the
+        // folder goes plain again.
+        let data = GitData::new(Some(d.clone()), HashMap::new());
+        tree.apply_git(&data);
+        assert_eq!(tree.root.find_mut(&d.join("docs")).unwrap().git, None);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -776,10 +830,7 @@ mod tests {
         let mut statuses = HashMap::new();
         statuses.insert(d.join("packages/pkg-a/node_modules"), GitStatus::Ignored);
         statuses.insert(d.join("packages/pkg-a/dist"), GitStatus::Ignored);
-        let data = GitData {
-            toplevel: Some(d.clone()),
-            statuses,
-        };
+        let data = GitData::new(Some(d.clone()), statuses);
         tree.apply_git(&data);
 
         // The non-ignored parents must keep git == None (not propagated Ignored).

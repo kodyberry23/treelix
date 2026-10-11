@@ -30,14 +30,19 @@ It was built to replace [broot](https://dystroy.org/broot/) as the file sidebar.
 - **Diagnostics from the editor**: the patched Helix pushes every file's LSP
   error/warning counts over the same socket as whole snapshots
   (`diagnostics-begin <sender> <seq>` … `diagnostics-end <seq>`), applied
-  atomically; from one sender only newer snapshots apply, and a new sender (a
-  restarted editor) applies at once. Files turn red or yellow with a count
-  after the name, and every folder above takes the worst severity inside, so
-  a problem in a collapsed folder is still visible. An exiting editor sends
-  `diagnostics-bye <sender> <seq>`, which clears the tree only if that editor's
-  snapshot is the one on display, so a file it never saw fixed does not stay
-  red after it is gone. `diagnostics = "errors" | "off"` in the config narrows
-  or disables it.
+  atomically. Snapshots are kept per sender: from one sender only newer
+  snapshots apply, and a new sender (a restarted editor) applies at once.
+  When several editors push to one sidebar, the tree shows their union, with
+  each file taking the larger error and warning counts any editor reports.
+  Files turn red or yellow with a count after the name, and every folder above
+  takes the worst severity inside, so a problem in a collapsed folder is still
+  visible. An exiting editor sends `diagnostics-bye <sender> <seq>`, which
+  retracts only that editor's snapshot, so a file it never saw fixed does not
+  stay red after it is gone. An editor that exits without a farewell (killed,
+  or a build too old to send one) is pruned within about 5 seconds once its
+  process is gone. Known limit: if the system reuses a dead editor's pid, its
+  marks stay until that new process exits too. `diagnostics = "errors" |
+  "off"` in the config narrows or disables it.
 - **Reveal / follow**: a tiny IPC socket lets Helix tell treelix to reveal the
   current buffer (`treelix reveal <path>`), replacing broot's
   `--listen`/`--send`. With the helix-files integration, the patched Helix
@@ -194,8 +199,9 @@ split — the picker selects an existing window, it never creates a new one.
 
 ## Roadmap
 
-**Implemented:** tree render with icons/indent guides, git status (+ folder
-propagation), auto-reload/file-watching, full file ops, open-in-Helix
+**Implemented:** tree render with icons/indent guides, git status (a folder
+takes the worst status git reports below it, loaded or collapsed, like the
+diagnostics), auto-reload/file-watching, full file ops, open-in-Helix
 (vsplit/hsplit/preview/system), reveal IPC, theming + Helix-theme import,
 hidden/ignored/git-clean/custom/no-buffer/no-bookmark filters, live filter
 (`f`/`F`) and search (`S`) via `nucleo`, sort modes + files-first, group-empty

@@ -216,7 +216,10 @@ fn resolve_pane_id(name: &str) -> Option<String> {
     None
 }
 
-/// Per-session Helix socket path, matching the dotfiles' `launch-editor.sh`.
+/// The Helix socket path: `HELIX_SOCKET_PATH` when set, otherwise a
+/// per-session path. The helix-files launchers always export the per-tab path,
+/// so the session-level derivation here is only the fallback when no
+/// environment is set (treelix run outside the launchers).
 pub fn helix_socket_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("HELIX_SOCKET_PATH") {
         if !p.is_empty() {
